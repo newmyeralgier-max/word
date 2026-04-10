@@ -1,0 +1,4 @@
+python-docx
+pywin32
+latex2mathml
+lxml

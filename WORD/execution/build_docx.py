@@ -68,13 +68,23 @@ def _add_source_code(doc, code, language=""):
 # ??????????????????????????????????????????????????????????????????
 
 def _add_equation(doc, latex_str):
-    """Display-формула (по центру). Авто-нумерация."""
+    """Display-формула (по центру). Авто-нумерация по правому краю."""
     p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
     p.paragraph_format.first_line_indent = Cm(0)
     p.paragraph_format.space_before = Pt(6)
     p.paragraph_format.space_after  = Pt(6)
     p.paragraph_format.line_spacing = cfg.LINE_SPACING
+
+    # Настраиваем табуляцию: центр на 8.25 см, правый край на 16.5 см
+    from docx.enum.text import WD_TAB_ALIGNMENT
+    tab_stops = p.paragraph_format.tab_stops
+    if len(tab_stops) > 0:
+        tab_stops.clear_all()
+    tab_stops.add_tab_stop(Cm(8.25), WD_TAB_ALIGNMENT.CENTER)
+    tab_stops.add_tab_stop(Cm(16.5), WD_TAB_ALIGNMENT.RIGHT)
+
+    p.add_run("\t")
 
     omml = wu.latex_to_omml(latex_str)
     if omml is not None:
@@ -85,8 +95,8 @@ def _add_equation(doc, latex_str):
         run.font.size = cfg.FONT_SIZE_MAIN
         run.italic = True
 
-    # Авто-нумерация через SEQ
-    run = p.add_run("\t\t(")
+    # Авто-нумерация через SEQ на правом краю
+    run = p.add_run("\t(")
     run.font.name = cfg.FONT_NAME
     run.font.size = cfg.FONT_SIZE_MAIN
     wu.add_seq_field(run, "Формула")
@@ -417,7 +427,7 @@ def _read_inputs(input_path):
 #  Главная сборка
 # ??????????????????????????????????????????????????????????????????
 
-def build_document(input_path, output=None, no_com=False):
+def build_document(input_path, output=None, no_com=False, append_doc_path=None):
     if not os.path.exists(input_path):
         print(f"[!] Путь не найден: {input_path}")
         return
@@ -433,15 +443,22 @@ def build_document(input_path, output=None, no_com=False):
     ast_tokens = md(raw_md)
     print(f"  + AST-нод: {len(ast_tokens)}")
 
-    doc = Document()
-    for section in doc.sections:
-        section.top_margin    = cfg.MARGIN_TOP
-        section.bottom_margin = cfg.MARGIN_BOTTOM
-        section.left_margin   = cfg.MARGIN_LEFT
-        section.right_margin  = cfg.MARGIN_RIGHT
+    if append_doc_path and os.path.exists(append_doc_path):
+        doc = Document(append_doc_path)
+        print(f"  + Открыт существующий документ для дозаписи: {append_doc_path}")
+        # Если добавляем текст, добавим разрыв страницы перед новыми данными
+        if doc.paragraphs:
+            doc.add_page_break()
+    else:
+        doc = Document()
+        for section in doc.sections:
+            section.top_margin    = cfg.MARGIN_TOP
+            section.bottom_margin = cfg.MARGIN_BOTTOM
+            section.left_margin   = cfg.MARGIN_LEFT
+            section.right_margin  = cfg.MARGIN_RIGHT
 
     wu.setup_gost_styles(doc)
-    wu.add_page_numbering(doc, smart_skip=False)
+    wu.add_page_numbering(doc, smart_skip=True)
 
     has_h1 = False
     i = 0
@@ -600,6 +617,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Сборка Markdown в Word GOST")
     parser.add_argument('-i', '--input', help="Путь к файлу или папке", default=None)
     parser.add_argument('-o', '--output', help="Путь для сохранения", default=None)
+    parser.add_argument('-a', '--append', help="Путь к существующему Word-документу, в конец которого нужно дописать текст", default=None)
     parser.add_argument('--no-com', action='store_true', help="Пропустить обновление через MS Word")
     
     args = parser.parse_args()
@@ -608,4 +626,4 @@ if __name__ == '__main__':
     if not input_val:
         input_val = os.path.join(os.path.dirname(__file__), '..', '..', '.tmp', 'rewritten_guide_section1.md')
         
-    build_document(input_val, args.output, args.no_com)
+    build_document(input_val, args.output, args.no_com, args.append)

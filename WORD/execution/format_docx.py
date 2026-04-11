@@ -83,7 +83,7 @@ def _insert_toc_before_intro(doc):
 #  Главная функция
 # ??????????????????????????????????????????????????????????????????
 
-def format_document(input_path):
+def format_document(input_path, no_com=False):
     print(f"+ Читаем: {input_path}")
     doc = Document(input_path)
 
@@ -256,15 +256,30 @@ def format_document(input_path):
     wu.save_document_safe(doc, output)
 
     # ?? COM-обновление ????????????????????????????????????????????
-    wu.update_document_via_com(output)
+    if not no_com:
+        wu.update_document_via_com(output)
 
+
+import argparse
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Использование: python format_docx.py <документ.docx>")
-        sys.exit(1)
-    target = sys.argv[1]
+    parser = argparse.ArgumentParser(description="Форматирование Word документов по ГОСТ")
+    parser.add_argument('-i', '--input', required=True, help="Путь к файлу или папке для обработки")
+    parser.add_argument('-o', '--output', default=None, help="Путь для сохранения результата")
+    parser.add_argument('--no-com', action='store_true', help="Пропустить обновление через MS Word")
+    
+    args = parser.parse_args()
+    
+    target = args.input
     if not os.path.exists(target):
-        print(f"[!] Файл не найден: {target}")
+        print(f"[!] Путь не найден: {target}")
         sys.exit(1)
-    format_document(target)
+        
+    if os.path.isdir(target):
+        files = glob.glob(os.path.join(target, "*.docx"))
+        from utils.docx_utils import find_working_files
+        working_files = [f for f in files if "GOST" not in f and not os.path.basename(f).startswith("~")]
+        for f in working_files:
+            format_document(f, args.no_com)
+    else:
+        format_document(target, args.no_com)

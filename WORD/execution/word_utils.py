@@ -164,6 +164,31 @@ def add_page_field(run):
         run._r.append(el)
 
 
+def add_seq_field(run, seq_name="Рисунок"):
+    """Вставить поле SEQ (автонумерация) в данный run."""
+    fldChar1 = OxmlElement('w:fldChar')
+    fldChar1.set(qn('w:fldCharType'), 'begin')
+    run._r.append(fldChar1)
+
+    instrText = OxmlElement('w:instrText')
+    instrText.set(qn('xml:space'), 'preserve')
+    instrText.text = f' SEQ {seq_name} \\* ARABIC '
+    run._r.append(instrText)
+
+    fldChar2 = OxmlElement('w:fldChar')
+    fldChar2.set(qn('w:fldCharType'), 'separate')
+    run._r.append(fldChar2)
+
+    t = OxmlElement('w:t')
+    t.text = '1'
+    run._r.append(t)
+
+    fldChar3 = OxmlElement('w:fldChar')
+    fldChar3.set(qn('w:fldCharType'), 'end')
+    run._r.append(fldChar3)
+
+
+
 def add_page_numbering(doc, *, smart_skip=True, align=WD_ALIGN_PARAGRAPH.RIGHT):
     """
     Добавить номера страниц в футер.

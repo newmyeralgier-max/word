@@ -41,16 +41,19 @@ def replace_text_in_paragraph(paragraph, old_text: str, new_text: str) -> bool:
             return True
 
     # Сложный случай: текст разбит между runs
-    # Собираем весь текст, заменяем, перезаписываем
-    new_full = full_text.replace(old_text, new_text)
-    if paragraph.runs:
-        # Сохраняем форматирование первого run
-        first_run = paragraph.runs[0]
-        first_run.text = new_full
-        # Очищаем остальные runs
-        for run in paragraph.runs[1:]:
-            run.text = ""
-    return True
+    # Перезаписываем аккуратно, находя только те runs, которые содержат искомый текст.
+    runs = paragraph.runs
+    for i in range(len(runs)):
+        for j in range(i + 1, len(runs) + 1):
+            combined_text = "".join(r.text for r in runs[i:j])
+            if old_text in combined_text:
+                # Нашли минимальный набор runs
+                runs[i].text = combined_text.replace(old_text, new_text)
+                for r in runs[i+1:j]:
+                    r.text = ""
+                return True
+                
+    return False
 
 
 def replace_text_globally(doc: Document, old_text: str, new_text: str) -> int:

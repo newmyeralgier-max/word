@@ -107,18 +107,18 @@ def text_to_latex(formula: str) -> str:
         result = result.replace(text_val, latex_val)
 
     # Обработка дробей: a/b → \frac{a}{b}
-    # Простые дроби: одно число или переменная
+    # Поддержка дробей с десятичными числами (точка или запятая)
     result = re.sub(
-        r'(\w+)\s*/\s*(\w+)',
+        r'([\w\.,]+)\s*/\s*([\w\.,]+)',
         r'\\frac{\1}{\2}',
         result
     )
 
-    # Обработка индексов: X_р, I_1, U_ном
-    result = re.sub(r'_(\w+)', r'_{\1}', result)
+    # Обработка индексов
+    result = re.sub(r'_([\w]+)', r'_{\1}', result)
 
-    # Обработка степеней: X^2, U^2
-    result = re.sub(r'\^(\w+)', r'^{\1}', result)
+    # Обработка степеней
+    result = re.sub(r'\^([\w]+)', r'^{\1}', result)
 
     return result
 

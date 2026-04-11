@@ -11,17 +11,18 @@
 """
 
 import subprocess, sys, os, re, glob
+import win32com.client
+from docx import Document
+from docx.shared import Pt, Cm, Mm, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml.ns import qn, nsdecls
+from docx.oxml import parse_xml, OxmlElement
+from lxml import etree
+import latex2mathml.converter
 
-# === Автоустановка зависимостей ===
-def ensure_package(pkg, pip_name=None):
-    try:
-        __import__(pkg)
-    except ImportError:
-        subprocess.check_call([sys.executable, '-m', 'pip', 'install', pip_name or pkg, '-q'])
-
-ensure_package('docx', 'python-docx')
-ensure_package('latex2mathml')
-ensure_package('win32com', 'pywin32')
+sys.path.insert(0, str(os.path.dirname(os.path.abspath(__file__))))
+from utils.docx_utils import add_page_number_to_run, generate_toc_run
 
 import win32com.client
 from docx import Document
@@ -67,7 +68,7 @@ def _get_xslt():
         print(f"  OMML XSLT найден: {xsl_path}")
     else:
         _xsl_transform = False  # Маркер «не найдено»
-        print("  ⚠ MML2OMML.XSL не найден — формулы будут в текстовом виде")
+        print("  [!] MML2OMML.XSL not found - formulas as text")
     return _xsl_transform
 
 
@@ -86,7 +87,7 @@ def latex_to_omml(latex_str):
         omml_tree = xslt(mathml_tree)
         return omml_tree.getroot()
     except Exception as e:
-        print(f"  ⚠ Ошибка конвертации формулы: {e}")
+        print(f"  [!] Formula conversion error: {e}")
         return None
 
 
@@ -174,25 +175,7 @@ def create_gost_document():
     return doc
 
 
-def add_page_number(run):
-    fldChar1 = OxmlElement('w:fldChar')
-    fldChar1.set(qn('w:fldCharType'), 'begin')
-    
-    instrText = OxmlElement('w:instrText')
-    instrText.set(qn('xml:space'), 'preserve')
-    instrText.text = "PAGE"
-    
-    fldChar2 = OxmlElement('w:fldChar')
-    fldChar2.set(qn('w:fldCharType'), 'separate')
-    
-    fldChar3 = OxmlElement('w:fldChar')
-    fldChar3.set(qn('w:fldCharType'), 'end')
-    
-    run._r.append(fldChar1)
-    run._r.append(instrText)
-    run._r.append(fldChar2)
-    run._r.append(fldChar3)
-
+# Removed add_page_number in favor of utils.docx_utils.add_page_number_to_run
 
 def add_page_numbering(doc):
     for section in doc.sections:
@@ -203,7 +186,7 @@ def add_page_numbering(doc):
         run = p.add_run()
         run.font.name = 'Times New Roman'
         run.font.size = Pt(14)
-        add_page_number(run)
+        add_page_number_to_run(run)
 
 
 def add_heading(doc, text, level=1):
@@ -339,23 +322,7 @@ def add_toc(doc):
     p_toc.paragraph_format.first_line_indent = Cm(0)
     run_toc = p_toc.add_run()
     
-    fldChar1 = OxmlElement('w:fldChar')
-    fldChar1.set(qn('w:fldCharType'), 'begin')
-    
-    instrText = OxmlElement('w:instrText')
-    instrText.set(qn('xml:space'), 'preserve')
-    instrText.text = 'TOC \\o "1-3" \\h \\z \\u'
-    
-    fldChar2 = OxmlElement('w:fldChar')
-    fldChar2.set(qn('w:fldCharType'), 'separate')
-    
-    fldChar3 = OxmlElement('w:fldChar')
-    fldChar3.set(qn('w:fldCharType'), 'end')
-    
-    run_toc._r.append(fldChar1)
-    run_toc._r.append(instrText)
-    run_toc._r.append(fldChar2)
-    run_toc._r.append(fldChar3)
+    generate_toc_run(run_toc, placeholder_text="[Оглавление собрано автоматически]")
     
     # Добавляем разрыв страницы после TOC
     doc.add_page_break()
@@ -642,12 +609,14 @@ def build_document():
         version += 1
         
     doc.save(output)
-    print(f"\n✅ Документ сохранён: {os.path.abspath(output)}")
+    print(f"\n[OK] Saved: {os.path.abspath(output)}")
     print(f"   Параграфов: {len(doc.paragraphs)}")
     print(f"   Таблиц: {len(doc.tables)}")
     
     # === Открываем Word и обновляем оглавление программно ===
-    print("\n⏳ Запускаем MS Word для генерации номеров страниц и открытия файла...")
+    print("\n[...] Opening MS Word for TOC/page update...")
+    word = None
+    doc_com = None
     try:
         word = win32com.client.Dispatch("Word.Application")
         word.Visible = True
@@ -664,10 +633,22 @@ def build_document():
             toc.Range.Font.Bold = False
             
         doc_com.Save()
-        print("✅ Оглавление и страницы успешно обновлены Word!")
+        print("[OK] TOC and pages updated!")
         
     except Exception as e:
-        print(f"⚠️ Ошибка при открытии файла в Word (возможно не установлен MS Office): {e}")
+        print(f"[!] Error opening Word: {e}")
+        if doc_com is not None:
+            try:
+                doc_com.Close(False)
+            except:
+                pass
+    finally:
+        if word is not None:
+            try:
+                # Оставляем Word открытым
+                pass
+            except:
+                pass
 
 
 if __name__ == '__main__':

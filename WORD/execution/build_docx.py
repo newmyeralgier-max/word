@@ -1,654 +1,620 @@
 """
-Скрипт для сборки переписанного гайда по MATLAB/Simulink в формат .docx
-Форматирование по ГОСТ 7.32-2017 (для методических указаний):
-- Шрифт: Times New Roman, 14 пт (основной текст), 16 пт (заголовки разделов)
-- Интервал: 1.5 строки
-- Отступ первой строки: 1.25 см
-- Поля: левое 30 мм, правое 15 мм, верхнее/нижнее 20 мм
-- Выравнивание основного текста: по ширине
-- Заголовки разделов: по центру, полужирный
-- Формулы: нативные Word-формулы (OMML) через LaTeX → MathML → OMML
+build_docx.py -- Сборка ГОСТ-документа из Markdown-файла.
+
+? Парсинг Markdown через mistune (AST-рендерер)
+? LaTeX-формулы ? OMML (нативные Word-уравнения)
+? Автооглавление (TOC), нумерация страниц
+? Все стили и токены из word_config.py / word_utils.py
 """
 
-import subprocess, sys, os, re, glob
-import win32com.client
+import sys, os, re
+
+# ?? Путь к модулям рядом ??????????????????????????????????????????
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import word_config as cfg
+import word_utils  as wu
+
+# Зависимости (ставятся автоматически через word_utils ? ensure не нужен)
+import mistune
 from docx import Document
-from docx.shared import Pt, Cm, Mm, RGBColor
+from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn, nsdecls
 from docx.oxml import parse_xml, OxmlElement
-from lxml import etree
-import latex2mathml.converter
-
-sys.path.insert(0, str(os.path.dirname(os.path.abspath(__file__))))
-from utils.docx_utils import add_page_number_to_run, generate_toc_run
-
-import win32com.client
-from docx import Document
-from docx.shared import Pt, Cm, Mm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn, nsdecls
-from docx.oxml import parse_xml, OxmlElement
-from lxml import etree
-import latex2mathml.converter
 
 
-# ======================================================================
-#  OMML (Office Math Markup) — конвертер LaTeX → Word-формулы
-# ======================================================================
+# ??????????????????????????????????????????????????????????????????
+#  Вспомогательные: формулы
+# ??????????????????????????????????????????????????????????????????
 
-def find_mml2omml_xsl():
-    """Найти XSLT-файл MML2OMML.XSL из установки Microsoft Office."""
-    patterns = [
-        r"C:\Program Files\Microsoft Office\root\Office*\MML2OMML.XSL",
-        r"C:\Program Files (x86)\Microsoft Office\root\Office*\MML2OMML.XSL",
-        r"C:\Program Files\Microsoft Office\Office*\MML2OMML.XSL",
-        r"C:\Program Files (x86)\Microsoft Office\Office*\MML2OMML.XSL",
-    ]
-    for pat in patterns:
-        found = glob.glob(pat)
-        if found:
-            return found[0]
-    return None
-
-# Кэш XSLT для повторного использования
-_xsl_transform = None
-
-def _get_xslt():
-    global _xsl_transform
-    if _xsl_transform is not None:
-        return _xsl_transform
-    
-    xsl_path = find_mml2omml_xsl()
-    if xsl_path:
-        xsl_tree = etree.parse(xsl_path)
-        _xsl_transform = etree.XSLT(xsl_tree)
-        print(f"  OMML XSLT найден: {xsl_path}")
-    else:
-        _xsl_transform = False  # Маркер «не найдено»
-        print("  [!] MML2OMML.XSL not found - formulas as text")
-    return _xsl_transform
-
-
-def latex_to_omml(latex_str):
-    """Конвертировать LaTeX → OMML XML-элемент для вставки в Word."""
-    xslt = _get_xslt()
-    if not xslt:
-        return None
-    
-    try:
-        # LaTeX → MathML
-        mathml_str = latex2mathml.converter.convert(latex_str)
-        mathml_tree = etree.fromstring(mathml_str.encode('utf-8'))
-        
-        # MathML → OMML
-        omml_tree = xslt(mathml_tree)
-        return omml_tree.getroot()
-    except Exception as e:
-        print(f"  [!] Formula conversion error: {e}")
-        return None
-
-
-def add_equation(doc, latex_str, formula_number=""):
-    """Добавить формулу в документ как нативное Word-уравнение (OMML)."""
+def _add_equation(doc, latex_str, formula_number=""):
+    """Display-формула (по центру)."""
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.first_line_indent = Cm(0)
     p.paragraph_format.space_before = Pt(6)
-    p.paragraph_format.space_after = Pt(6)
-    p.paragraph_format.line_spacing = 1.5
-    
-    omml = latex_to_omml(latex_str)
+    p.paragraph_format.space_after  = Pt(6)
+    p.paragraph_format.line_spacing = cfg.LINE_SPACING
+
+    omml = wu.latex_to_omml(latex_str)
     if omml is not None:
-        # Вставляем OMML-элемент в параграф
         p._element.append(omml)
     else:
-        # Фоллбэк: текстовая формула
         run = p.add_run(latex_str)
-        run.font.name = 'Cambria Math'
-        run.font.size = Pt(14)
+        run.font.name = cfg.FONT_NAME_MATH
+        run.font.size = cfg.FONT_SIZE_MAIN
         run.italic = True
-    
-    # Номер формулы справа
+
     if formula_number:
         run = p.add_run(f"\t\t{formula_number}")
-        run.font.name = 'Times New Roman'
-        run.font.size = Pt(14)
-    
+        run.font.name = cfg.FONT_NAME
+        run.font.size = cfg.FONT_SIZE_MAIN
     return p
 
 
-def add_inline_math(paragraph, latex_str):
-    """Добавить инлайн-формулу в существующий параграф как OMML."""
-    omml = latex_to_omml(latex_str)
+def _add_inline_math(paragraph, latex_str):
+    """Инлайн-формула внутри абзаца."""
+    omml = wu.latex_to_omml(latex_str)
     if omml is not None:
         paragraph._element.append(omml)
     else:
-        # Фоллбэк: курсив Cambria Math
         run = paragraph.add_run(latex_str)
-        run.font.name = 'Cambria Math'
-        run.font.size = Pt(14)
+        run.font.name = cfg.FONT_NAME_MATH
+        run.font.size = cfg.FONT_SIZE_MAIN
         run.italic = True
 
 
-# ======================================================================
-#  ГОСТ-форматирование документа
-# ======================================================================
+# ??????????????????????????????????????????????????????????????????
+#  Вспомогательные: таблицы
+# ??????????????????????????????????????????????????????????????????
 
-def create_gost_document():
-    doc = Document()
-    for section in doc.sections:
-        section.top_margin = Mm(20)
-        section.bottom_margin = Mm(20)
-        section.left_margin = Mm(30)
-        section.right_margin = Mm(15)
-    
-    style_normal = doc.styles['Normal']
-    font = style_normal.font
-    font.name = 'Times New Roman'
-    font.size = Pt(14)
-    font.color.rgb = RGBColor(0, 0, 0)
-    pf = style_normal.paragraph_format
-    pf.space_before = Pt(0)
-    pf.space_after = Pt(0)
-    pf.line_spacing = 1.5
-    pf.first_line_indent = Cm(1.25)
-    pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-    pf.widow_control = True  # Контроль висячих строк
-    
-    # Настраиваем стили оглавления, чтобы они не были разреженными
-    for i in range(1, 4):
-        try:
-            toc_style = doc.styles[f'TOC {i}']
-            toc_style.font.name = 'Times New Roman'
-            toc_style.font.size = Pt(14)
-            toc_style.font.bold = False
-            toc_style.paragraph_format.space_before = Pt(0)
-            toc_style.paragraph_format.space_after = Pt(0)
-            toc_style.paragraph_format.line_spacing = 1.5
-        except KeyError:
-            pass
-            
-    add_page_numbering(doc)
-    return doc
-
-
-# Removed add_page_number in favor of utils.docx_utils.add_page_number_to_run
-
-def add_page_numbering(doc):
-    for section in doc.sections:
-        footer = section.footer
-        p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT  # Изменено по просьбе: справа
-        p.clear()
-        run = p.add_run()
-        run.font.name = 'Times New Roman'
-        run.font.size = Pt(14)
-        add_page_number_to_run(run)
-
-
-def add_heading(doc, text, level=1):
-    p = doc.add_paragraph()
-    
-    # Внедряем Outline Level для автооглавления (TOC)
-    pPr = p._element.get_or_add_pPr()
-    outlineLvl = OxmlElement('w:outlineLvl')
-    outlineLvl.set(qn('w:val'), str(level - 1))
-    pPr.append(outlineLvl)
-
-    # ВСЕ заголовки по центру и без отступа первой строки
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.space_after = Pt(12)
-    p.paragraph_format.line_spacing = 1.5
-    p.paragraph_format.keep_with_next = True
-
-    # ГОСТ Форматирование
-    if level == 1:
-        # H1: По центру, 16 пт, НЕ жирный
-        p.paragraph_format.space_before = Pt(24)
-        font_size = Pt(16)
-        is_bold = False
-    elif level == 2:
-        # H2: По центру, 14 пт, жирный
-        p.paragraph_format.space_before = Pt(18)
-        font_size = Pt(14)
-        is_bold = True
-    else:
-        # H3: По центру, 14 пт, НЕ жирный
-        p.paragraph_format.space_before = Pt(18)
-        font_size = Pt(14)
-        is_bold = False
-    
-    run = p.add_run(text.rstrip('.'))
-    run.bold = is_bold
-    run.font.name = 'Times New Roman'
-    run.font.size = font_size
-    run.font.color.rgb = RGBColor(0, 0, 0)
-
-
-def add_paragraph_rich(doc, text, indent=True, align='justify'):
-    """
-    Добавить абзац с поддержкой:
-    - **bold**  →  полужирный
-    - *italic*  →  курсив
-    - `code`    →  Courier New 12 пт
-    - $latex$   →  инлайн OMML-формула
-    """
-    p = doc.add_paragraph()
-    if align == 'justify':
-        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-    elif align == 'center':
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    else:
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    
-    p.paragraph_format.first_line_indent = Cm(1.25) if indent else Cm(0)
-    p.paragraph_format.line_spacing = 1.5
-    p.paragraph_format.space_before = Pt(0)
-    p.paragraph_format.space_after = Pt(0)
-    
-    # Разбиваем текст на части: **bold**, *italic*, `code`, $math$
-    # Порядок важен: сначала ** (чтобы не перехватил *), затем *, затем `, затем $
-    token_re = re.compile(r'(\*\*.*?\*\*|\*[^*]+?\*|`[^`]+?`|\$[^$]+?\$)')
-    parts = token_re.split(text)
-    
-    for part in parts:
-        if not part:
-            continue
-        if part.startswith('**') and part.endswith('**'):
-            run = p.add_run(part[2:-2])
-            run.bold = True
-            run.font.name = 'Times New Roman'
-            run.font.size = Pt(14)
-        elif part.startswith('*') and part.endswith('*'):
-            run = p.add_run(part[1:-1])
-            run.italic = True
-            run.font.name = 'Times New Roman'
-            run.font.size = Pt(14)
-        elif part.startswith('`') and part.endswith('`'):
-            run = p.add_run(part[1:-1])
-            run.font.name = 'Courier New'
-            run.font.size = Pt(12)
-        elif part.startswith('$') and part.endswith('$'):
-            latex = part[1:-1]
-            add_inline_math(p, latex)
-        else:
-            run = p.add_run(part)
-            run.font.name = 'Times New Roman'
-            run.font.size = Pt(14)
-    
-    return p
-
-
-def add_figure_caption(doc, text):
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.space_before = Pt(6)
-    p.paragraph_format.space_after = Pt(12)
-    p.paragraph_format.line_spacing = 1.5
-    run = p.add_run(text)
-    run.italic = True
-    run.font.name = 'Times New Roman'
-    run.font.size = Pt(14)
-def add_image_centered(doc, image_path):
-    """Вставляет картинку по центру документа."""
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.space_before = Pt(12)
-    p.paragraph_format.space_after = Pt(6)
-    p.paragraph_format.keep_with_next = True
-    run = p.add_run()
-    # Ограничиваем максимальную ширину картинки
-    run.add_picture(image_path, width=Cm(16))
-
-
-def add_toc(doc):
-    """Добавить автособираемое оглавление."""
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    # ГОСТ: СОДЕРЖАНИЕ прописными буквами
-    run = p.add_run('СОДЕРЖАНИЕ')
-    run.bold = False
-    run.font.name = 'Times New Roman'
-    run.font.size = Pt(16)
-    
-    p_toc = doc.add_paragraph()
-    p_toc.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    p_toc.paragraph_format.first_line_indent = Cm(0)
-    run_toc = p_toc.add_run()
-    
-    generate_toc_run(run_toc, placeholder_text="[Оглавление собрано автоматически]")
-    
-    # Добавляем разрыв страницы после TOC
-    doc.add_page_break()
-
-
-
-
-
-# ======================================================================
-#  Таблицы
-# ======================================================================
-
-def set_cell_border(cell):
+def _set_cell_border(cell):
     tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
-    tcBorders = parse_xml(
+    tcPr.append(parse_xml(
         f'<w:tcBorders {nsdecls("w")}>'
         f'  <w:top w:val="single" w:sz="4" w:space="0" w:color="000000"/>'
         f'  <w:left w:val="single" w:sz="4" w:space="0" w:color="000000"/>'
         f'  <w:bottom w:val="single" w:sz="4" w:space="0" w:color="000000"/>'
         f'  <w:right w:val="single" w:sz="4" w:space="0" w:color="000000"/>'
         f'</w:tcBorders>'
-    )
-    tcPr.append(tcBorders)
+    ))
 
 
-def add_table_caption(doc, text):
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.space_before = Pt(12)
-    p.paragraph_format.space_after = Pt(6)
-    p.paragraph_format.line_spacing = 1.5
-    p.paragraph_format.keep_with_next = True
-    run = p.add_run(text)
-    run.font.name = 'Times New Roman'
-    run.font.size = Pt(14)
+def _add_table(doc, header_cells, data_rows, caption=""):
+    if caption:
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.first_line_indent = Cm(0)
+        p.paragraph_format.space_before = Pt(12)
+        p.paragraph_format.space_after  = Pt(6)
+        p.paragraph_format.line_spacing = cfg.LINE_SPACING
+        p.paragraph_format.keep_with_next = True
+        run = p.add_run(caption)
+        run.font.name = cfg.FONT_NAME
+        run.font.size = cfg.FONT_SIZE_MAIN
 
-
-def add_markdown_table(doc, header_cells, data_rows):
-    num_cols = len(header_cells)
-    table = doc.add_table(rows=len(data_rows) + 1, cols=num_cols)
+    ncols = len(header_cells)
+    table = doc.add_table(rows=len(data_rows) + 1, cols=ncols)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.autofit = True
-    
-    # Позволяем Word самому распределять ширину колонок
-    tblLayout = OxmlElement('w:tblLayout')
-    tblLayout.set(qn('w:type'), 'autofit')
-    table._tbl.tblPr.append(tblLayout)
-    
-    for j, cell_text in enumerate(header_cells):
+    tl = OxmlElement('w:tblLayout')
+    tl.set(qn('w:type'), 'autofit')
+    table._tbl.tblPr.append(tl)
+
+    for j, txt in enumerate(header_cells):
         cell = table.cell(0, j)
         cell.text = ''
         p = cell.paragraphs[0]
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.first_line_indent = Cm(0)
         p.paragraph_format.space_before = Pt(2)
-        p.paragraph_format.space_after = Pt(2)
+        p.paragraph_format.space_after  = Pt(2)
         p.paragraph_format.line_spacing = 1.0
-        run = p.add_run(cell_text.strip())
+        run = p.add_run(txt.strip())
         run.bold = True
-        run.font.name = 'Times New Roman'
-        run.font.size = Pt(12)
-        set_cell_border(cell)
-    
-    for i, row_cells in enumerate(data_rows):
-        for j in range(num_cols):
+        run.font.name = cfg.FONT_NAME
+        run.font.size = cfg.FONT_SIZE_TABLE
+        _set_cell_border(cell)
+
+    for i, row in enumerate(data_rows):
+        for j in range(ncols):
             cell = table.cell(i + 1, j)
             cell.text = ''
             p = cell.paragraphs[0]
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT if j > 0 else WD_ALIGN_PARAGRAPH.CENTER
             p.paragraph_format.first_line_indent = Cm(0)
             p.paragraph_format.space_before = Pt(2)
-            p.paragraph_format.space_after = Pt(2)
+            p.paragraph_format.space_after  = Pt(2)
             p.paragraph_format.line_spacing = 1.0
-            text = row_cells[j].strip() if j < len(row_cells) else ''
-            run = p.add_run(text)
-            run.font.name = 'Times New Roman'
-            run.font.size = Pt(12)
-            set_cell_border(cell)
-    
+            txt = row[j].strip() if j < len(row) else ''
+            run = p.add_run(txt)
+            run.font.name = cfg.FONT_NAME
+            run.font.size = cfg.FONT_SIZE_TABLE
+            _set_cell_border(cell)
+
+    spacer = doc.add_paragraph()
+    spacer.paragraph_format.space_before = Pt(6)
+    spacer.paragraph_format.space_after  = Pt(0)
+    spacer.paragraph_format.first_line_indent = Cm(0)
+
+
+# ??????????????????????????????????????????????????????????????????
+#  Вспомогательные: изображения и подписи
+# ??????????????????????????????????????????????????????????????????
+
+def _add_figure_caption(doc, text):
     p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(6)
-    p.paragraph_format.space_after = Pt(0)
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.first_line_indent = Cm(0)
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after  = Pt(12)
+    p.paragraph_format.line_spacing = cfg.LINE_SPACING
+    run = p.add_run(text)
+    run.italic    = True
+    run.font.name = cfg.FONT_NAME
+    run.font.size = cfg.FONT_SIZE_MAIN
 
 
-# ======================================================================
-#  Главный парсер
-# ======================================================================
+def _add_image_centered(doc, image_path):
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.first_line_indent = Cm(0)
+    p.paragraph_format.space_before = Pt(12)
+    p.paragraph_format.space_after  = Pt(6)
+    p.paragraph_format.keep_with_next = True
+    run = p.add_run()
+    run.add_picture(image_path, width=Cm(16))
 
-def auto_wrap_subscripts(text):
+
+# ??????????????????????????????????????????????????????????????????
+#  TOC
+# ??????????????????????????????????????????????????????????????????
+
+def _add_toc(doc):
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.first_line_indent = Cm(0)
+    run = p.add_run('СОДЕРЖАНИЕ')
+    run.bold      = False
+    run.font.name = cfg.FONT_NAME
+    run.font.size = cfg.FONT_SIZE_TOC_TITLE
+
+    pt = doc.add_paragraph()
+    pt.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    pt.paragraph_format.first_line_indent = Cm(0)
+    rt = pt.add_run()
+    # TOC field
+    for tag, attr, text in [
+        ('w:fldChar', 'begin', None),
+        ('w:instrText', None, 'TOC \\o "1-3" \\h \\z \\u'),
+        ('w:fldChar', 'separate', None),
+        ('w:fldChar', 'end', None),
+    ]:
+        el = OxmlElement(tag)
+        if tag == 'w:instrText':
+            el.set(qn('xml:space'), 'preserve')
+            el.text = text
+        else:
+            el.set(qn('w:fldCharType'), attr)
+        rt._r.append(el)
+
+    doc.add_page_break()
+
+
+# ??????????????????????????????????????????????????????????????????
+#  Heading
+# ??????????????????????????????????????????????????????????????????
+
+def _add_heading(doc, text, level=1):
+    """Добавить заголовок с Outline Level (видимый для TOC)."""
+    bold_map = {1: cfg.BOLD_H1, 2: cfg.BOLD_H2, 3: cfg.BOLD_H3}
+    size_map = {1: cfg.FONT_SIZE_H1, 2: cfg.FONT_SIZE_H2, 3: cfg.FONT_SIZE_H3}
+
+    p = doc.add_paragraph()
+
+    # Outline Level
+    pPr = p._element.get_or_add_pPr()
+    ol  = OxmlElement('w:outlineLvl')
+    ol.set(qn('w:val'), str(level - 1))
+    pPr.append(ol)
+
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.first_line_indent = Cm(0)
+    p.paragraph_format.space_before      = Pt(24) if level == 1 else Pt(18)
+    p.paragraph_format.space_after       = Pt(12)
+    p.paragraph_format.line_spacing      = cfg.LINE_SPACING
+    p.paragraph_format.keep_with_next    = True
+
+    run = p.add_run(text.rstrip('.'))
+    run.bold       = bold_map.get(level, False)
+    run.font.name  = cfg.FONT_NAME
+    run.font.size  = size_map.get(level, cfg.FONT_SIZE_MAIN)
+    run.font.color.rgb = cfg.COLOR_BLACK
+    return p
+
+
+# ??????????????????????????????????????????????????????????????????
+#  Rich-text paragraph
+# ??????????????????????????????????????????????????????????????????
+
+def _add_rich_paragraph(doc, text, indent=True, align='justify'):
     """
-    Автоматически находит переменные с нижним индексом (например: T_s, U_н, ω_б)
-    и оборачивает их в $...$ для рендеринга как OMML-формулы, 
-    если они ещё не обернуты.
+    Добавить абзац с инлайн-разметкой:
+        **bold**, *italic*, `code`, $math$
     """
-    # Разделяем текст на уже защищенные блоки (код и формулы) и обычный текст
+    p = doc.add_paragraph()
+    ALIGN = {
+        'justify': WD_ALIGN_PARAGRAPH.JUSTIFY,
+        'center':  WD_ALIGN_PARAGRAPH.CENTER,
+        'left':    WD_ALIGN_PARAGRAPH.LEFT,
+    }
+    p.alignment = ALIGN.get(align, WD_ALIGN_PARAGRAPH.JUSTIFY)
+    p.paragraph_format.first_line_indent = cfg.FIRST_LINE_INDENT if indent else Cm(0)
+    p.paragraph_format.line_spacing      = cfg.LINE_SPACING
+    p.paragraph_format.space_before      = Pt(0)
+    p.paragraph_format.space_after       = Pt(0)
+
+    token_re = re.compile(r'(\*\*.*?\*\*|\*[^*]+?\*|`[^`]+?`|\$[^$]+?\$)')
+    for part in token_re.split(text):
+        if not part:
+            continue
+        if part.startswith('**') and part.endswith('**'):
+            run = p.add_run(part[2:-2])
+            run.bold = True
+            run.font.name = cfg.FONT_NAME
+            run.font.size = cfg.FONT_SIZE_MAIN
+        elif part.startswith('*') and part.endswith('*'):
+            run = p.add_run(part[1:-1])
+            run.italic    = True
+            run.font.name = cfg.FONT_NAME
+            run.font.size = cfg.FONT_SIZE_MAIN
+        elif part.startswith('`') and part.endswith('`'):
+            run = p.add_run(part[1:-1])
+            run.font.name = cfg.FONT_NAME_CODE
+            run.font.size = cfg.FONT_SIZE_CODE
+        elif part.startswith('$') and part.endswith('$'):
+            _add_inline_math(p, part[1:-1])
+        else:
+            run = p.add_run(part)
+            run.font.name = cfg.FONT_NAME
+            run.font.size = cfg.FONT_SIZE_MAIN
+    return p
+
+
+# ??????????????????????????????????????????????????????????????????
+#  Авто-обёртка подстрочных индексов  T_s ? $T_s$
+# ??????????????????????????????????????????????????????????????????
+
+_SUB_RE = re.compile(
+    r'(?<![A-Za-zА-Яа-яЁё0-9])'
+    r'([A-Za-zА-Яа-яЁё\u03c9\u03c0]+_[A-Za-zА-Яа-яЁё0-9]+)'
+    r'(?![A-Za-zА-Яа-яЁё0-9])'
+)
+
+def _auto_wrap_subscripts(text):
     parts = re.split(r'(`[^`]+?`|\$[^$]+?\$)', text)
     for i in range(0, len(parts), 2):
-        if not parts[i]: continue
-        # Ищем: (не буква/цифра) + (буквы/греческие) + _ + (буквы/цифры) + (не буква/цифра)
-        parts[i] = re.sub(r'(?<![A-Za-zА-Яа-яЁё0-9])([A-Za-zА-Яа-яЁё\u03c9\u03c0]+_[A-Za-zА-Яа-яЁё0-9]+)(?![A-Za-zА-Яа-яЁё0-9])', r'$\1$', parts[i])
+        if parts[i]:
+            parts[i] = _SUB_RE.sub(r'$\1$', parts[i])
     return ''.join(parts)
 
 
+# ??????????????????????????????????????????????????????????????????
+#  Главный парсер -- PRE-PROCESS + MISTUNE AST
+# ??????????????????????????????????????????????????????????????????
+
+def _preprocess_md(raw: str) -> str:
+    """
+    Выделяем конструкции, которые mistune не знает:
+    - [TOC]  ? оставляем как есть (отловим в AST по тексту)
+    - $$...$$ display формулы внутри строки ? оборачиваем в отдельные строки
+    """
+    return raw
+
+
+def _render_inline_children(paragraph, children):
+    """Рекурсивно добавить инлайн-ноды AST в один абзац."""
+    for child in children:
+        tp = child['type']
+
+        if tp == 'text':
+            raw = child.get('raw', child.get('text', ''))
+            # проверяем на подстрочные индексы
+            raw = _auto_wrap_subscripts(raw)
+            # Если внутри есть $...$  -- разделяем
+            parts = re.split(r'(\$[^$]+?\$)', raw)
+            for part in parts:
+                if not part:
+                    continue
+                if part.startswith('$') and part.endswith('$'):
+                    _add_inline_math(paragraph, part[1:-1])
+                else:
+                    run = paragraph.add_run(part)
+                    run.font.name = cfg.FONT_NAME
+                    run.font.size = cfg.FONT_SIZE_MAIN
+        elif tp == 'strong':
+            run = paragraph.add_run(child.get('raw', '') or _children_text(child))
+            run.bold      = True
+            run.font.name = cfg.FONT_NAME
+            run.font.size = cfg.FONT_SIZE_MAIN
+        elif tp == 'emphasis':
+            run = paragraph.add_run(child.get('raw', '') or _children_text(child))
+            run.italic    = True
+            run.font.name = cfg.FONT_NAME
+            run.font.size = cfg.FONT_SIZE_MAIN
+        elif tp == 'codespan':
+            run = paragraph.add_run(child.get('raw', child.get('text', '')))
+            run.font.name = cfg.FONT_NAME_CODE
+            run.font.size = cfg.FONT_SIZE_CODE
+        elif tp == 'softbreak' or tp == 'linebreak':
+            pass  # пропускаем мягкие переносы
+        else:
+            # fallback -- просто текст
+            txt = child.get('raw', child.get('text', ''))
+            if txt:
+                run = paragraph.add_run(txt)
+                run.font.name = cfg.FONT_NAME
+                run.font.size = cfg.FONT_SIZE_MAIN
+
+
+def _children_text(node):
+    """Извлечь плоский текст из children."""
+    if 'children' not in node:
+        return node.get('raw', node.get('text', ''))
+    return ''.join(_children_text(c) for c in node['children'])
+
+
+def _flat_text(node):
+    """Извлечь полный плоский текст из AST-ноды рекурсивно."""
+    if isinstance(node, str):
+        return node
+    text = node.get('raw', '') or node.get('text', '')
+    if 'children' in node and node['children']:
+        text += ''.join(_flat_text(c) for c in node['children'])
+    return text
+
+
 def build_document():
-    import sys
-    
+    """Точка входа: чтение .md ? сборка .docx ? COM-обновление."""
+
     if len(sys.argv) > 1:
         src = sys.argv[1]
     else:
         tmp_dir = os.path.join(os.path.dirname(__file__), '..', '..', '.tmp')
         src = os.path.join(tmp_dir, 'rewritten_guide_section1.md')
-        
+
     if not os.path.exists(src):
-        print(f"Файл не найден: {src}")
+        print(f"[!] Файл не найден: {src}")
         return
 
-    print(f"Исходный файл: {src}")
-    
-    # Считаем общее число строк
+    print(f"+ Исходный файл: {src}")
+
     with open(src, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-        
-    print(f"  Прочитано {len(lines)} строк.")
-    
-    doc = create_gost_document()
-    
+        raw_md = f.read()
+
+    raw_md = _preprocess_md(raw_md)
+
+    # ?? Парсинг Markdown ? AST ????????????????????????????????????
+    md = mistune.create_markdown(renderer='ast')
+    ast_tokens = md(raw_md)
+    print(f"  + AST-нод: {len(ast_tokens)}")
+
+    # ?? Создание документа ????????????????????????????????????????
+    doc = Document()
+    for section in doc.sections:
+        section.top_margin    = cfg.MARGIN_TOP
+        section.bottom_margin = cfg.MARGIN_BOTTOM
+        section.left_margin   = cfg.MARGIN_LEFT
+        section.right_margin  = cfg.MARGIN_RIGHT
+
+    wu.setup_gost_styles(doc)
+    wu.add_page_numbering(doc, smart_skip=False)
+
     has_h1 = False
 
+    # ?? Обход AST ?????????????????????????????????????????????????
     i = 0
-    while i < len(lines):
-        line = lines[i].rstrip('\n').rstrip('\r')
-        
-        if not line.strip():
-            i += 1
-            continue
-            
-        # --- Оглавление (TOC) ---
-        if line.strip().upper() == '[TOC]' or line.strip() == '[[TOC]]':
-            add_toc(doc)
-            i += 1
-            continue
-        
-        # --- Заголовок H1 ---
-        if line.startswith('# ') and not line.startswith('## '):
-            if has_h1:
-                doc.add_page_break()
-            has_h1 = True
-            add_heading(doc, line[2:].strip(), level=1)
-            i += 1
-            continue
-        
-        # --- Заголовок H2 ---
-        if line.startswith('## ') and not line.startswith('### '):
-            add_heading(doc, line[3:].strip(), level=2)
-            i += 1
-            continue
-        
-        # --- Заголовок H3 ---
-        if line.startswith('### '):
-            add_heading(doc, line[4:].strip(), level=3)
-            i += 1
-            continue
-        
-        # --- Подпись к рисунку ---
-        if line.strip().startswith('*Рисунок ') and line.strip().endswith('*'):
-            caption_text = line.strip()[1:-1]
-            # Пытаемся найти номер рисунка для авто-изображения
-            m = re.search(r'Рисунок\s+(\d+\.\d+)', caption_text)
-            if m:
-                fig_num = m.group(1)
-                img_path_png = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'images', f'fig{fig_num}.png')
-                img_path_jpg = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'images', f'fig{fig_num}.jpg')
-                if os.path.exists(img_path_png):
-                    add_image_centered(doc, img_path_png)
-                elif os.path.exists(img_path_jpg):
-                    add_image_centered(doc, img_path_jpg)
-                    
-            add_figure_caption(doc, caption_text)
-            i += 1
-            continue
-        
-        # --- Таблица (подпись + markdown table) ---
-        if re.match(r'^Таблица \d', line.strip()):
-            caption_text = line.strip()
-            i += 1
-            while i < len(lines) and not lines[i].strip():
-                i += 1
-            table_lines = []
-            while i < len(lines) and lines[i].strip().startswith('|'):
-                table_lines.append(lines[i].strip())
-                i += 1
-            if table_lines:
-                header = [c.strip() for c in table_lines[0].split('|')[1:-1]]
-                data = [[c.strip() for c in tl.split('|')[1:-1]] for tl in table_lines[2:]]
-                add_table_caption(doc, caption_text)
-                add_markdown_table(doc, header, data)
-            else:
-                add_table_caption(doc, caption_text)
-            continue
-        
-        # --- Подпись к таблице (старый формат *Таблица ...*) ---
-        if line.strip().startswith('*Таблица ') and line.strip().endswith('*'):
-            add_figure_caption(doc, line.strip()[1:-1])
-            i += 1
-            continue
-        
-        # --- Display-формула: $$latex$$ (номер) ---
-        display_match = re.match(r'^\$\$(.+?)\$\$\s*(\(\d+\.\d+\))?\s*$', line.strip())
-        if display_match:
-            latex = display_match.group(1).strip()
-            number = display_match.group(2) or ""
-            add_equation(doc, latex, number)
-            i += 1
-            continue
-        
-        # --- Строка с $$формулой$$ внутри текста ---
-        if '$$' in line.strip():
-            # Разделяем текст и формулу
-            parts = re.split(r'\$\$(.+?)\$\$', line.strip())
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.first_line_indent = Cm(1.25)
-            p.paragraph_format.line_spacing = 1.5
-            p.paragraph_format.space_before = Pt(0)
-            p.paragraph_format.space_after = Pt(0)
-            for idx, part in enumerate(parts):
-                if idx % 2 == 0:
-                    # Обычный текст
-                    if part.strip():
-                        run = p.add_run(part)
-                        run.font.name = 'Times New Roman'
-                        run.font.size = Pt(14)
-                else:
-                    # Формула
-                    add_inline_math(p, part.strip())
-            i += 1
-            continue
-        
-        # --- Элемент списка через тире ---
-        if line.strip().startswith('– ') or line.strip().startswith('- '):
-            txt = line.strip()[2:] if line.strip().startswith('– ') else line.strip()[2:]
-            add_paragraph_rich(doc, auto_wrap_subscripts('– ' + txt))
-            i += 1
-            continue
-        
-        # --- Элемент списка буквами типа "а)", "б)", "в)" ---
-        letter_match = re.match(r'^([а-яА-ЯёЁ]\))\s+(.+)$', line.strip())
-        if letter_match:
-            add_paragraph_rich(doc, auto_wrap_subscripts(f"{letter_match.group(1)} {letter_match.group(2)}"))
+    while i < len(ast_tokens):
+        node = ast_tokens[i]
+        tp = node['type']
+
+        # ?? Заголовки ?????????????????????????????????????????????
+        if tp == 'heading':
+            level = node['attrs']['level']
+            text  = _flat_text(node).strip()
+
+            if level == 1:
+                if has_h1:
+                    doc.add_page_break()
+                has_h1 = True
+            _add_heading(doc, text, level=min(level, 3))
             i += 1
             continue
 
-        # --- Нумерованный список (не 1.1, 1.2, ...) ---
-        num_match = re.match(r'^(\d+)\.\s+(.+)$', line.strip())
-        if num_match and not re.match(r'^1\.\d', line.strip()):
-            add_paragraph_rich(doc, auto_wrap_subscripts(f"{num_match.group(1)}. {num_match.group(2)}"))
+        # ?? Параграф ??????????????????????????????????????????????
+        if tp == 'paragraph':
+            raw = _flat_text(node).strip()
+
+            # [TOC]
+            if raw.upper() in ('[TOC]', '[[TOC]]'):
+                _add_toc(doc)
+                i += 1
+                continue
+
+            # Подпись к рисунку: *Рисунок X.X -- ...*
+            if raw.startswith('*Рисунок ') and raw.endswith('*'):
+                caption_text = raw[1:-1]
+                m = re.search(r'Рисунок\s+(\d+\.\d+)', caption_text)
+                if m:
+                    fig_num = m.group(1)
+                    base = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'images')
+                    for ext in ('png', 'jpg'):
+                        img = os.path.join(base, f'fig{fig_num}.{ext}')
+                        if os.path.exists(img):
+                            _add_image_centered(doc, img)
+                            break
+                _add_figure_caption(doc, caption_text)
+                i += 1
+                continue
+
+            # Display-формула $$...$$
+            dm = re.match(r'^\$\$(.+?)\$\$\s*(\(\d+\.\d+\))?\s*$', raw)
+            if dm:
+                _add_equation(doc, dm.group(1).strip(), dm.group(2) or "")
+                i += 1
+                continue
+
+            # Строка с $$...$$ внутри текста
+            if '$$' in raw:
+                parts = re.split(r'\$\$(.+?)\$\$', raw)
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                p.paragraph_format.first_line_indent = cfg.FIRST_LINE_INDENT
+                p.paragraph_format.line_spacing      = cfg.LINE_SPACING
+                p.paragraph_format.space_before      = Pt(0)
+                p.paragraph_format.space_after       = Pt(0)
+                for idx, part in enumerate(parts):
+                    if idx % 2 == 0:
+                        if part.strip():
+                            run = p.add_run(part)
+                            run.font.name = cfg.FONT_NAME
+                            run.font.size = cfg.FONT_SIZE_MAIN
+                    else:
+                        _add_inline_math(p, part.strip())
+                i += 1
+                continue
+
+            # Подпись к таблице
+            if re.match(r'^Таблица\s+\d', raw):
+                # Запоминаем caption, следующий блок -- таблица
+                caption_text = raw
+                # Пробуем найти следующий токен-таблицу
+                if i + 1 < len(ast_tokens) and ast_tokens[i + 1]['type'] == 'table':
+                    i += 1  # перейдём к таблице, caption передадим ниже
+                    node = ast_tokens[i]
+                    tp = 'table'
+                    node['_caption'] = caption_text
+                else:
+                    p = doc.add_paragraph()
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    p.paragraph_format.first_line_indent = Cm(0)
+                    p.paragraph_format.keep_with_next    = True
+                    run = p.add_run(caption_text)
+                    run.font.name = cfg.FONT_NAME
+                    run.font.size = cfg.FONT_SIZE_MAIN
+                    i += 1
+                    continue
+
+            # Подпись рисунка (старый формат): *Таблица ...*
+            if raw.startswith('*Таблица ') and raw.endswith('*'):
+                _add_figure_caption(doc, raw[1:-1])
+                i += 1
+                continue
+
+            # Обычный абзац с rich-инлайн
+            if tp == 'paragraph' and 'children' in node and node['children']:
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                p.paragraph_format.first_line_indent = cfg.FIRST_LINE_INDENT
+                p.paragraph_format.line_spacing      = cfg.LINE_SPACING
+                p.paragraph_format.space_before      = Pt(0)
+                p.paragraph_format.space_after       = Pt(0)
+                _render_inline_children(p, node['children'])
+                i += 1
+                continue
+
+            # Простой абзац-фолбэк
+            _add_rich_paragraph(doc, _auto_wrap_subscripts(raw))
             i += 1
             continue
-        
-        # --- Элемент описания рисунка: "1 — текст" ---
-        if re.match(r'^\d+\s*—\s*.+$', line.strip()):
-            add_paragraph_rich(doc, auto_wrap_subscripts(line.strip()))
+
+        # ?? Таблица ???????????????????????????????????????????????
+        if tp == 'table':
+            caption = node.get('_caption', '')
+            header_cells = []
+            data_rows    = []
+
+            if 'children' in node:
+                for child in node['children']:
+                    if child['type'] == 'table_head':
+                        for row in child.get('children', []):
+                            header_cells = [_flat_text(c) for c in row.get('children', [])]
+                    elif child['type'] == 'table_body':
+                        for row in child.get('children', []):
+                            data_rows.append([_flat_text(c) for c in row.get('children', [])])
+
+            if header_cells:
+                _add_table(doc, header_cells, data_rows, caption)
             i += 1
             continue
-        
-        # --- Обычный абзац (с поддержкой $inline$ математики) ---
-        add_paragraph_rich(doc, auto_wrap_subscripts(line.strip()))
+
+        # ?? Список ????????????????????????????????????????????????
+        if tp == 'list':
+            ordered = node.get('attrs', {}).get('ordered', False)
+            for li_idx, item in enumerate(node.get('children', [])):
+                text = _flat_text(item).strip()
+                if ordered:
+                    prefix = f"{li_idx + 1}. "
+                else:
+                    prefix = "- "
+                _add_rich_paragraph(doc, _auto_wrap_subscripts(prefix + text))
+            i += 1
+            continue
+
+        # ?? Блок кода ?????????????????????????????????????????????
+        if tp == 'code':
+            raw = node.get('raw', node.get('text', ''))
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.first_line_indent = Cm(0)
+            p.paragraph_format.line_spacing      = 1.0
+            p.paragraph_format.space_before      = Pt(6)
+            p.paragraph_format.space_after       = Pt(6)
+            run = p.add_run(raw)
+            run.font.name = cfg.FONT_NAME_CODE
+            run.font.size = cfg.FONT_SIZE_CODE
+            i += 1
+            continue
+
+        # ?? Тематический разрыв (---) ????????????????????????????
+        if tp == 'thematic_break':
+            doc.add_page_break()
+            i += 1
+            continue
+
+        # ?? Blank / неизвестный ????????????????????????????????????
+        if tp == 'blank_line' or tp == 'newline':
+            i += 1
+            continue
+
+        # fallback -- raw text
+        raw = node.get('raw', node.get('text', ''))
+        if raw and raw.strip():
+            _add_rich_paragraph(doc, _auto_wrap_subscripts(raw.strip()))
         i += 1
-    
+
+    # ?? Сохранение ????????????????????????????????????????????????
     out_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'data')
     os.makedirs(out_dir, exist_ok=True)
-    
+
     base_name = os.path.splitext(os.path.basename(src))[0]
-    
     version = 1
     while True:
         out_name = f"{base_name}_v{version}.docx"
-        output = os.path.join(out_dir, out_name)
+        output   = os.path.join(out_dir, out_name)
         if not os.path.exists(output):
             break
         version += 1
-        
-    doc.save(output)
-    print(f"\n[OK] Saved: {os.path.abspath(output)}")
+
+    wu.save_document_safe(doc, output)
     print(f"   Параграфов: {len(doc.paragraphs)}")
     print(f"   Таблиц: {len(doc.tables)}")
-    
-    # === Открываем Word и обновляем оглавление программно ===
-    print("\n[...] Opening MS Word for TOC/page update...")
-    word = None
-    doc_com = None
-    try:
-        word = win32com.client.Dispatch("Word.Application")
-        word.Visible = True
-        
-        abs_output = os.path.abspath(output)
-        doc_com = word.Documents.Open(abs_output)
-        
-        # Обновляем все поля
-        doc_com.Fields.Update()
-        
-        # Прямое обновление оглавления
-        for toc in doc_com.TablesOfContents:
-            toc.Update()
-            toc.Range.Font.Bold = False
-            
-        doc_com.Save()
-        print("[OK] TOC and pages updated!")
-        
-    except Exception as e:
-        print(f"[!] Error opening Word: {e}")
-        if doc_com is not None:
-            try:
-                doc_com.Close(False)
-            except:
-                pass
-    finally:
-        if word is not None:
-            try:
-                # Оставляем Word открытым
-                pass
-            except:
-                pass
+
+    # ?? COM-обновление ????????????????????????????????????????????
+    wu.update_document_via_com(output)
 
 
 if __name__ == '__main__':

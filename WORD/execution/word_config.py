@@ -1,16 +1,46 @@
+"""
+word_config.py — Централизованные ГОСТ-константы для всех скриптов Word.
+
+Все размеры, шрифты, отступы и поля вынесены сюда.
+При смене ГОСТа меняется ОДИН файл.
+"""
 from docx.shared import Pt, Cm, Mm, RGBColor
 
-# ГОСТ Настройки
-FONT_NAME = 'Times New Roman'
-FONT_SIZE_MAIN = Pt(14)
-FONT_SIZE_H1 = Pt(16)
-FONT_SIZE_H2 = Pt(14)
-FONT_SIZE_H3 = Pt(14)
+# ─── Шрифты ────────────────────────────────────────────────────────
+FONT_NAME           = 'Times New Roman'
+FONT_NAME_CODE      = 'Courier New'
+FONT_NAME_MATH      = 'Cambria Math'
 
-MARGIN_TOP = Mm(20)
+# ─── Размеры шрифта ───────────────────────────────────────────────
+FONT_SIZE_MAIN      = Pt(14)
+FONT_SIZE_H1        = Pt(16)
+FONT_SIZE_H2        = Pt(14)
+FONT_SIZE_H3        = Pt(14)
+FONT_SIZE_CODE      = Pt(12)
+FONT_SIZE_TABLE     = Pt(12)
+FONT_SIZE_TOC_TITLE = Pt(16)
+
+# ─── Жирность заголовков ──────────────────────────────────────────
+BOLD_H1 = False
+BOLD_H2 = True
+BOLD_H3 = False
+
+# ─── Поля страницы ────────────────────────────────────────────────
+MARGIN_TOP    = Mm(20)
 MARGIN_BOTTOM = Mm(20)
-MARGIN_LEFT = Mm(30)
-MARGIN_RIGHT = Mm(15)
+MARGIN_LEFT   = Mm(30)
+MARGIN_RIGHT  = Mm(15)
 
-# STRICT H1 HEADINGS (without numbering)
-STRICT_H1 = ["ВВЕДЕНИЕ", "ЗАКЛЮЧЕНИЕ", "СПИСОК ЛИТЕРАТУРЫ", "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ", "РЕФЕРАТ", "ЗАДАНИЕ"]
+# ─── Отступы абзацев ──────────────────────────────────────────────
+FIRST_LINE_INDENT = Cm(1.25)
+LINE_SPACING      = 1.5
+
+# ─── Цвет текста ──────────────────────────────────────────────────
+COLOR_BLACK = RGBColor(0, 0, 0)
+
+# ─── ГОСТ H1 заголовки (без нумерации, по центру) ─────────────────
+STRICT_H1 = [
+    "ВВЕДЕНИЕ", "ЗАКЛЮЧЕНИЕ",
+    "СПИСОК ЛИТЕРАТУРЫ", "СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ",
+    "РЕФЕРАТ", "ЗАДАНИЕ",
+]

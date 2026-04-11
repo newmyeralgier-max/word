@@ -23,20 +23,23 @@ if "%~1"=="" (
     echo .md or .docx file directly onto this .bat icon!
     echo.
     echo What do you want to do right now?
-    echo 1 - Build GOST document from Markdown ^(.md^)
-    echo 2 - Format and fix existing Word document ^(.docx^)
+    echo 1 - Build GOST document (Modern 7.32-2017)
+    echo 2 - Build GOST document (Legacy / Professor style)
+    echo 3 - Format existing Word document ^(.docx^)
     echo.
-    set /p choice="Enter 1 or 2 and press Enter: "
+    set /p choice="Enter 1, 2, or 3 and press Enter: "
     echo.
     if "!choice!"=="1" (
         set /p filepath="Enter or drag-and-drop the path to .md file: "
         set "filepath=!filepath:"=!"
-        :: ИСПРАВЛЕНИЕ: Добавлен флаг -i перед путем к файлу
         "%PYTHON_EXEC%" "%BUILD_SCRIPT%" -i "!filepath!"
     ) else if "!choice!"=="2" (
+        set /p filepath="Enter or drag-and-drop the path to .md file: "
+        set "filepath=!filepath:"=!"
+        "%PYTHON_EXEC%" "%BUILD_SCRIPT%" -i "!filepath!" --legacy
+    ) else if "!choice!"=="3" (
         set /p filepath="Enter or drag-and-drop the path to .docx file: "
         set "filepath=!filepath:"=!"
-        :: ИСПРАВЛЕНИЕ: Добавлен флаг -i перед путем к файлу
         "%PYTHON_EXEC%" "%FORMAT_SCRIPT%" -i "!filepath!"
     ) else (
         echo Invalid choice!

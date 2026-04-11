@@ -27,9 +27,23 @@ from pygments import lex
 from pygments.lexers import get_lexer_by_name, guess_lexer
 from pygments.token import Token
 
-# ??????????????????????????????????????????????????????????????????
 #  Вспомогательные: Code Highlighting
 # ??????????????????????????????????????????????????????????????????
+
+def _apply_p_format(p, align, left_ind=Cm(0), right_ind=Cm(0), first_line_ind=Cm(0), 
+                   space_before=Pt(0), space_after=Pt(0), keep_next=False, 
+                   line_spacing=cfg.LINE_SPACING):
+    """Универсальная настройка формата абзаца."""
+    p.alignment = align
+    fmt = p.paragraph_format
+    fmt.left_indent = left_ind
+    fmt.right_indent = right_ind
+    fmt.first_line_indent = first_line_ind
+    fmt.space_before = space_before
+    fmt.space_after = space_after
+    fmt.keep_with_next = keep_next
+    fmt.line_spacing = line_spacing
+
 
 def _add_source_code(doc, code, language=""):
     p = doc.add_paragraph()
@@ -67,14 +81,10 @@ def _add_source_code(doc, code, language=""):
 #  Вспомогательные: формулы
 # ??????????????????????????????????????????????????????????????????
 
-def _add_equation(doc, latex_str):
+def _add_equation(doc, latex_str, h1_idx=0):
     """Display-формула (по центру). Авто-нумерация по правому краю."""
     p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.space_before = Pt(6)
-    p.paragraph_format.space_after  = Pt(6)
-    p.paragraph_format.line_spacing = cfg.LINE_SPACING
+    _apply_p_format(p, align=WD_ALIGN_PARAGRAPH.LEFT, space_before=Pt(6), space_after=Pt(6))
 
     # Настраиваем табуляцию: центр на 8.25 см, правый край на 16.5 см
     from docx.enum.text import WD_TAB_ALIGNMENT
@@ -96,10 +106,16 @@ def _add_equation(doc, latex_str):
         run.italic = True
 
     # Авто-нумерация через SEQ на правом краю
-    run = p.add_run("\t(")
+    if h1_idx > 0:
+        run = p.add_run(f"\t({h1_idx}.")
+    else:
+        run = p.add_run("\t(")
+
     run.font.name = cfg.FONT_NAME
     run.font.size = cfg.FONT_SIZE_MAIN
-    wu.add_seq_field(run, "Формула")
+    
+    seq_name = f"Формула_{h1_idx}" if h1_idx > 0 else "Формула"
+    wu.add_seq_field(run, seq_name)
     
     run_close = p.add_run(")")
     run_close.font.name = cfg.FONT_NAME
@@ -136,27 +152,38 @@ def _set_cell_border(cell):
     ))
 
 
-def _add_table(doc, header_cells, data_rows, caption=""):
+def _add_table_caption(doc, text, h1_idx=0):
+    """Подпись таблицы (две строки: номер справа, название по центру)."""
+    clean_caption = re.sub(r'^(?:\*?Таблица\s*[\d\.]*|\*?Таблица)\s*(?:--|-|—)?\s*', '', text.strip('* '))
+    
+    # 1. Номер (справа)
+    p1 = doc.add_paragraph()
+    _apply_p_format(p1, align=WD_ALIGN_PARAGRAPH.RIGHT, space_before=Pt(12), keep_next=True)
+    
+    if h1_idx > 0:
+        run1 = p1.add_run(f"Таблица {h1_idx}.")
+    else:
+        run1 = p1.add_run("Таблица ")
+    run1.font.name = cfg.FONT_NAME
+    run1.font.size = cfg.FONT_SIZE_MAIN
+    seq_name = f"Таблица_{h1_idx}" if h1_idx > 0 else "Таблица"
+    wu.add_seq_field(run1, seq_name)
+    
+    # 2. Название (по центру)
+    if clean_caption:
+        p2 = doc.add_paragraph()
+        _apply_p_format(p2, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=Pt(6), keep_next=True)
+        
+        run2 = p2.add_run(clean_caption)
+        run2.font.name = cfg.FONT_NAME
+        run2.font.size = cfg.FONT_SIZE_MAIN
+        return p2
+    return p1
+
+
+def _add_table(doc, header_cells, data_rows, caption="", h1_idx=0):
     if caption:
-        # Очищаем хардкод 'Таблица 1.1 -- '
-        clean_caption = re.sub(r'^(?:\*?Таблица\s*[\d\.]*|\*?Таблица)\s*(?:--|-|—)?\s*', '', caption.strip('* '))
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        p.paragraph_format.first_line_indent = Cm(0)
-        p.paragraph_format.space_before = Pt(12)
-        p.paragraph_format.space_after  = Pt(6)
-        p.paragraph_format.line_spacing = cfg.LINE_SPACING
-        p.paragraph_format.keep_with_next = True
-        
-        run = p.add_run("Таблица ")
-        run.font.name = cfg.FONT_NAME
-        run.font.size = cfg.FONT_SIZE_MAIN
-        wu.add_seq_field(run, "Таблица")
-        
-        if clean_caption:
-            run2 = p.add_run(" -- " + clean_caption)
-            run2.font.name = cfg.FONT_NAME
-            run2.font.size = cfg.FONT_SIZE_MAIN
+        _add_table_caption(doc, caption, h1_idx)
 
     ncols = len(header_cells)
     table = doc.add_table(rows=len(data_rows) + 1, cols=ncols)
@@ -168,33 +195,17 @@ def _add_table(doc, header_cells, data_rows, caption=""):
 
     for j, txt in enumerate(header_cells):
         cell = table.cell(0, j)
-        cell.text = ''
         p = cell.paragraphs[0]
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.first_line_indent = Cm(0)
-        p.paragraph_format.space_before = Pt(2)
-        p.paragraph_format.space_after  = Pt(2)
-        p.paragraph_format.line_spacing = 1.0
-        run = p.add_run(txt.strip())
-        run.bold = True
-        run.font.name = cfg.FONT_NAME
-        run.font.size = cfg.FONT_SIZE_TABLE
+        _add_rich_text_to_paragraph(p, txt, font_size=cfg.FONT_SIZE_TABLE)
         _set_cell_border(cell)
 
     for i, row in enumerate(data_rows):
         for j in range(ncols):
             cell = table.cell(i + 1, j)
-            cell.text = ''
             p = cell.paragraphs[0]
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT if j > 0 else WD_ALIGN_PARAGRAPH.CENTER
-            p.paragraph_format.first_line_indent = Cm(0)
-            p.paragraph_format.space_before = Pt(2)
-            p.paragraph_format.space_after  = Pt(2)
-            p.paragraph_format.line_spacing = 1.0
-            txt = row[j].strip() if j < len(row) else ''
-            run = p.add_run(txt)
-            run.font.name = cfg.FONT_NAME
-            run.font.size = cfg.FONT_SIZE_TABLE
+            p.paragraph_format.first_line_indent = 0
+            _add_rich_text_to_paragraph(p, row[j], font_size=cfg.FONT_SIZE_TABLE)
             _set_cell_border(cell)
 
     spacer = doc.add_paragraph()
@@ -207,35 +218,34 @@ def _add_table(doc, header_cells, data_rows, caption=""):
 #  Вспомогательные: изображения и подписи
 # ??????????????????????????????????????????????????????????????????
 
-def _add_figure_caption(doc, text):
+def _add_figure_caption(doc, text, h1_idx=0):
     clean_caption = re.sub(r'^(?:\*?Рисунок\s*[\d\.]*|\*?Рисунок)\s*(?:--|-|—)?\s*', '', text.strip('* '))
     p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.space_before = Pt(6)
-    p.paragraph_format.space_after  = Pt(12)
-    p.paragraph_format.line_spacing = cfg.LINE_SPACING
+    _apply_p_format(p, align=WD_ALIGN_PARAGRAPH.CENTER, space_before=Pt(6), space_after=Pt(12))
     
-    run = p.add_run("Рисунок ")
+    if h1_idx > 0:
+        run = p.add_run(f"Рис. {h1_idx}.")
+    else:
+        run = p.add_run("Рис. ")
+
     run.font.name = cfg.FONT_NAME
     run.font.size = cfg.FONT_SIZE_MAIN
-    wu.add_seq_field(run, "Рисунок")
+    seq_name = f"Рисунок_{h1_idx}" if h1_idx > 0 else "Рисунок"
+    wu.add_seq_field(run, seq_name)
     
     if clean_caption:
-        run2 = p.add_run(" -- " + clean_caption)
+        # Убираем возможные начальные точки/тире из названия и добавляем точку в конце
+        clean_text = re.sub(r'^[.\s—–-]+', '', clean_caption).strip()
+        run2 = p.add_run(f". {clean_text}.")
         run2.font.name = cfg.FONT_NAME
         run2.font.size = cfg.FONT_SIZE_MAIN
 
 
 def _add_image_centered(doc, image_path):
     p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.first_line_indent = Cm(0)
-    p.paragraph_format.space_before = Pt(12)
-    p.paragraph_format.space_after  = Pt(6)
-    p.paragraph_format.keep_with_next = True
+    _apply_p_format(p, align=WD_ALIGN_PARAGRAPH.CENTER, space_before=Pt(12), space_after=Pt(6), keep_next=True)
     run = p.add_run()
-    run.add_picture(image_path, width=Cm(16))
+    run.add_picture(image_path, width=Cm(15))
 
 
 # ??????????????????????????????????????????????????????????????????
@@ -259,7 +269,6 @@ def _add_toc(doc):
         ('w:fldChar', 'begin', None),
         ('w:instrText', None, 'TOC \\o "1-3" \\h \\z \\u'),
         ('w:fldChar', 'separate', None),
-        ('w:fldChar', 'end', None),
     ]:
         el = OxmlElement(tag)
         if tag == 'w:instrText':
@@ -268,6 +277,17 @@ def _add_toc(doc):
         else:
             el.set(qn('w:fldCharType'), attr)
         rt._r.append(el)
+
+    # Placeholder text for cases where COM update is skipped
+    tr = OxmlElement('w:r')
+    t = OxmlElement('w:t')
+    t.text = ' [Оглавление будет обновлено автоматически] '
+    tr.append(t)
+    rt._r.append(tr)
+
+    end = OxmlElement('w:fldChar')
+    end.set(qn('w:fldCharType'), 'end')
+    rt._r.append(end)
 
     doc.add_page_break()
 
@@ -301,46 +321,66 @@ def _add_heading(doc, text, level=1):
     return p
 
 
-# ??????????????????????????????????????????????????????????????????
+# ——————————————————————————————————————————————————————————————————
 #  Rich-text paragraph / Inline rendering
-# ??????????????????????????????????????????????????????????????????
+# ——————————————————————————————————————————————————————————————————
 
 def _add_rich_paragraph(doc, text, indent=True, align='justify'):
-    p = doc.add_paragraph()
-    ALIGN = {
-        'justify': WD_ALIGN_PARAGRAPH.JUSTIFY,
-        'center':  WD_ALIGN_PARAGRAPH.CENTER,
-        'left':    WD_ALIGN_PARAGRAPH.LEFT,
-    }
-    p.alignment = ALIGN.get(align, WD_ALIGN_PARAGRAPH.JUSTIFY)
-    p.paragraph_format.first_line_indent = cfg.FIRST_LINE_INDENT if indent else Cm(0)
-    p.paragraph_format.line_spacing      = cfg.LINE_SPACING
-    p.paragraph_format.space_before      = Pt(0)
-    p.paragraph_format.space_after       = Pt(0)
+    t_low = text.strip().lower()
+    marker_chars = r'0-9\-\u2013\u2014\.\•'
 
-    token_re = re.compile(r'(\*\*.*?\*\*|\*[^*]+?\*|`[^`]+?`|\$[^$]+?\$)')
-    for part in token_re.split(text):
-        if not part: continue
-        if part.startswith('**') and part.endswith('**'):
-            run = p.add_run(part[2:-2])
-            run.bold = True
-            run.font.name = cfg.FONT_NAME
-            run.font.size = cfg.FONT_SIZE_MAIN
-        elif part.startswith('*') and part.endswith('*'):
-            run = p.add_run(part[1:-1])
-            run.italic    = True
-            run.font.name = cfg.FONT_NAME
-            run.font.size = cfg.FONT_SIZE_MAIN
-        elif part.startswith('`') and part.endswith('`'):
-            run = p.add_run(part[1:-1])
-            run.font.name = cfg.FONT_NAME_CODE
-            run.font.size = cfg.FONT_SIZE_CODE
-        elif part.startswith('$') and part.endswith('$'):
-            _add_inline_math(p, part[1:-1])
-        else:
-            run = p.add_run(part)
-            run.font.name = cfg.FONT_NAME
-            run.font.size = cfg.FONT_SIZE_MAIN
+    # Авто-детект заголовков Рисунков/Таблиц для центрирования
+    if t_low.startswith('рисунок') or t_low.startswith('таблица') or t_low.startswith('рис.') or t_low.startswith('*рис.') or t_low.startswith('*рисунок') or t_low.startswith('*таблица'):
+        align = 'center'
+        indent = False
+    
+    # Авто-детект списков (если начинается с тире, точки или цифры - убираем отступ)
+    if re.match(r'^[' + marker_chars + r']', text.strip()):
+        indent = False
+
+    # === СИСТЕМА РАЗДЕЛЕНИЯ СКЛЕЕННЫХ СПИСКОВ ===
+
+    is_where = t_low.startswith('где ') or t_low.startswith('здесь ')
+    
+    # Рекурсивная функция для применения деления
+    def _apply_split(p_text, pattern, current_indent):
+        if re.search(pattern, p_text):
+            sub_parts = re.split(pattern, p_text)
+            for i, pt in enumerate(sub_parts):
+                val = pt.strip()
+                if not val: continue
+                # Первая часть сохраняет отступ, остальные - нет
+                _add_rich_paragraph(doc, val, indent=(current_indent if i==0 else False), align='left')
+            return True
+        return False
+
+    # 1. По ";" (для "где" любые слова, для остальных - маркеры)
+    if is_where:
+        split_pat = r'(?<=;)\s*(?=[\w\\а-яА-ЯёЁ])'
+    else:
+        split_pat = r'(?<=;)\s*(?=[' + marker_chars + r'])'
+
+    if _apply_split(text, split_pat, indent):
+        return
+
+    # 2. По ":" если за ним сразу тире/маркер
+    colon_split_pat = r'(?<=[:])\s*(?=[' + marker_chars + r'])'
+    if _apply_split(text, colon_split_pat, indent):
+        return
+    # === КОНЕЦ СИСТЕМЫ РАЗДЕЛЕНИЯ ===
+    p = doc.add_paragraph()
+
+    # Центрирование или отступ
+    if align == 'center':
+        _apply_p_format(p, align=WD_ALIGN_PARAGRAPH.CENTER)
+    else:
+        l_align = WD_ALIGN_PARAGRAPH.JUSTIFY
+        if align == 'left': l_align = WD_ALIGN_PARAGRAPH.LEFT
+        
+        f_indent = cfg.FIRST_LINE_INDENT if indent else Cm(0)
+        _apply_p_format(p, align=l_align, first_line_ind=f_indent)
+
+    _add_rich_text_to_paragraph(p, text)
     return p
 
 _SUB_RE = re.compile(
@@ -355,22 +395,56 @@ def _auto_wrap_subscripts(text):
     return ''.join(parts)
 
 
+def _add_rich_text_to_paragraph(paragraph, text, font_size=None):
+    """
+    Разбор текста с поддержкой:
+    - Авто-подстрочных индексов (B_л -> $B_л$)
+    - Жирный (**), Курсив (*), Код (`), Формулы ($)
+    """
+    if not text:
+        return
+
+    if font_size is None:
+        font_size = cfg.FONT_SIZE_MAIN
+
+    text = _auto_wrap_subscripts(text)
+    
+    # Регулярка для деления на токены
+    token_re = re.compile(r'(\*\*.*?\*\*|\*[^*]+?\*|`[^`]+?`|\$[^$]+?\$)')
+    
+    for part in token_re.split(text):
+        if not part:
+            continue
+            
+        if part.startswith('**') and part.endswith('**'):
+            run = paragraph.add_run(part[2:-2])
+            run.bold = True
+            run.font.name = cfg.FONT_NAME
+            run.font.size = font_size
+        elif part.startswith('*') and part.endswith('*'):
+            run = paragraph.add_run(part[1:-1])
+            run.italic = True
+            run.font.name = cfg.FONT_NAME
+            run.font.size = font_size
+        elif part.startswith('`') and part.endswith('`'):
+            run = paragraph.add_run(part[1:-1])
+            run.font.name = cfg.FONT_NAME_CODE
+            run.font.size = cfg.FONT_SIZE_CODE
+        elif part.startswith('$') and part.endswith('$'):
+            _add_inline_math(paragraph, part[1:-1])
+        else:
+            run = paragraph.add_run(part)
+            run.font.name = cfg.FONT_NAME
+            run.font.size = font_size
+
+
 def _render_inline_children(paragraph, children):
     for child in children:
         tp = child['type']
         raw = child.get('raw', child.get('text', ''))
         
         if tp == 'text':
-            raw = _auto_wrap_subscripts(raw)
-            parts = re.split(r'(\$[^$]+?\$)', raw)
-            for part in parts:
-                if not part: continue
-                if part.startswith('$') and part.endswith('$'):
-                    _add_inline_math(paragraph, part[1:-1])
-                else:
-                    run = paragraph.add_run(part)
-                    run.font.name = cfg.FONT_NAME
-                    run.font.size = cfg.FONT_SIZE_MAIN
+            _add_rich_text_to_paragraph(paragraph, raw)
         elif tp == 'strong':
             run = paragraph.add_run(raw or _children_text(child))
             run.bold      = True
@@ -427,7 +501,7 @@ def _read_inputs(input_path):
 #  Главная сборка
 # ??????????????????????????????????????????????????????????????????
 
-def build_document(input_path, output=None, no_com=False, append_doc_path=None):
+def build_document(input_path, output=None, fast=False, append_doc_path=None):
     if not os.path.exists(input_path):
         print(f"[!] Путь не найден: {input_path}")
         return
@@ -461,9 +535,10 @@ def build_document(input_path, output=None, no_com=False, append_doc_path=None):
     wu.add_page_numbering(doc, smart_skip=True)
 
     has_h1 = False
-    i = 0
-    while i < len(ast_tokens):
-        node = ast_tokens[i]
+    current_h1_idx = 0
+    token_iterator = enumerate(ast_tokens)
+
+    for i, node in token_iterator:
         tp = node['type']
 
         if tp == 'heading':
@@ -473,8 +548,9 @@ def build_document(input_path, output=None, no_com=False, append_doc_path=None):
                 if has_h1:
                     doc.add_page_break()
                 has_h1 = True
+                if text.upper() not in cfg.STRICT_H1:
+                    current_h1_idx += 1
             _add_heading(doc, text, level=min(level, 3))
-            i += 1
             continue
 
         if tp == 'paragraph':
@@ -482,37 +558,30 @@ def build_document(input_path, output=None, no_com=False, append_doc_path=None):
 
             if raw.upper() in ('[TOC]', '[[TOC]]'):
                 _add_toc(doc)
-                i += 1
                 continue
 
-            # Подпись Рисунка
-            if raw.startswith('*Рисунок ') and raw.endswith('*'):
-                caption_text = raw[1:-1]
+            # Подпись Рисунка (более гибкий поиск)
+            if re.match(r'^\*?\s*Рисунок\s*[\d\.]+', raw, re.I):
+                caption_text = raw.strip('* ')
                 m = re.search(r'Рисунок\s+(\d+\.\d+)', caption_text)
                 if m:
                     fig_num = m.group(1)
-                    for ext in ('png', 'jpg'):
-                        img = os.path.join(images_dir, f'fig{fig_num}.{ext}')
-                        if os.path.exists(img):
-                            _add_image_centered(doc, img)
-                            break
-                _add_figure_caption(doc, caption_text)
-                i += 1
+                    found_images = glob.glob(os.path.join(images_dir, f'fig{fig_num}.*'))
+                    if found_images:
+                        _add_image_centered(doc, found_images[0])
+                _add_figure_caption(doc, caption_text, current_h1_idx)
                 continue
 
             # Формулы
             dm = re.match(r'^\$\$(.+?)\$\$\s*(\(\d+\.\d+\))?\s*$', raw)
             if dm:
-                _add_equation(doc, dm.group(1).strip())
-                i += 1
+                _add_equation(doc, dm.group(1).strip(), current_h1_idx)
                 continue
 
             if '$$' in raw:
                 parts = re.split(r'\$\$(.+?)\$\$', raw)
                 p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                p.paragraph_format.first_line_indent = cfg.FIRST_LINE_INDENT
-                p.paragraph_format.line_spacing      = cfg.LINE_SPACING
+                _apply_p_format(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line_ind=cfg.FIRST_LINE_INDENT)
                 for idx, part in enumerate(parts):
                     if idx % 2 == 0:
                         if part.strip():
@@ -521,33 +590,44 @@ def build_document(input_path, output=None, no_com=False, append_doc_path=None):
                             run.font.size = cfg.FONT_SIZE_MAIN
                     else:
                         _add_inline_math(p, part.strip())
-                i += 1
                 continue
 
-            # Таблицы (caption)
+            # Таблицы (caption + lookahead)
             if re.match(r'^Таблица\s+\d', raw) or re.match(r'^\*Таблица\s+\d', raw):
                 caption_text = raw
                 if i + 1 < len(ast_tokens) and ast_tokens[i + 1]['type'] == 'table':
-                    i += 1
-                    node = ast_tokens[i]
+                    _, next_node = next(token_iterator)
+                    node = next_node
                     tp = 'table'
                     node['_caption'] = caption_text
                 else:
-                    _add_figure_caption(doc, caption_text)
-                    i += 1
+                    _add_table_caption(doc, caption_text, current_h1_idx)
                     continue
 
             if tp == 'paragraph' and 'children' in node and node['children']:
+                # === ПРОВЕРКА НА СПИСКИ (РАЗДЕЛЕНИЕ) ===
+                split_marker_chars = r'0-9\-\u2013\u2014\.\•'
+                is_where_clause = raw.lower().startswith('где ') or raw.lower().startswith('здесь ')
+                
+                needs_split = False
+                if is_where_clause and ';' in raw:
+                    needs_split = True
+                elif re.search(r';\s*[' + split_marker_chars + r']', raw):
+                    needs_split = True
+                elif re.search(r'(?<=[:])\s*(?=[' + split_marker_chars + r'])', raw):
+                    needs_split = True
+                
+                if needs_split:
+                    _add_rich_paragraph(doc, raw)
+                    continue
+                # ========================================
+
                 p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                p.paragraph_format.first_line_indent = cfg.FIRST_LINE_INDENT
-                p.paragraph_format.line_spacing      = cfg.LINE_SPACING
+                _apply_p_format(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY, first_line_ind=cfg.FIRST_LINE_INDENT)
                 _render_inline_children(p, node['children'])
-                i += 1
                 continue
 
             _add_rich_paragraph(doc, _auto_wrap_subscripts(raw))
-            i += 1
             continue
 
         if tp == 'table':
@@ -562,8 +642,7 @@ def build_document(input_path, output=None, no_com=False, append_doc_path=None):
                         for row in child.get('children', []):
                             data_rows.append([_flat_text(c) for c in row.get('children', [])])
             if header_cells:
-                _add_table(doc, header_cells, data_rows, caption)
-            i += 1
+                _add_table(doc, header_cells, data_rows, caption, current_h1_idx)
             continue
 
         if tp == 'list':
@@ -572,29 +651,24 @@ def build_document(input_path, output=None, no_com=False, append_doc_path=None):
                 text = _flat_text(item).strip()
                 prefix = f"{li_idx + 1}. " if ordered else "-- "
                 _add_rich_paragraph(doc, _auto_wrap_subscripts(prefix + text))
-            i += 1
             continue
 
         if tp == 'code':
             raw = node.get('raw', node.get('text', ''))
             info = node.get('attrs', {}).get('info', '')
             _add_source_code(doc, raw, info)
-            i += 1
             continue
 
         if tp == 'thematic_break':
             doc.add_page_break()
-            i += 1
             continue
 
         if tp in ('blank_line', 'newline'):
-            i += 1
             continue
 
         raw = node.get('raw', node.get('text', ''))
         if raw and raw.strip():
             _add_rich_paragraph(doc, _auto_wrap_subscripts(raw.strip()))
-        i += 1
 
     if output is None:
         out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'data')
@@ -610,7 +684,7 @@ def build_document(input_path, output=None, no_com=False, append_doc_path=None):
     print(f"   Параграфов: {len(doc.paragraphs)}")
     print(f"   Таблиц: {len(doc.tables)}")
 
-    if not no_com:
+    if not fast:
         wu.update_document_via_com(output)
 
 if __name__ == '__main__':
@@ -618,7 +692,7 @@ if __name__ == '__main__':
     parser.add_argument('-i', '--input', help="Путь к файлу или папке", default=None)
     parser.add_argument('-o', '--output', help="Путь для сохранения", default=None)
     parser.add_argument('-a', '--append', help="Путь к существующему Word-документу, в конец которого нужно дописать текст", default=None)
-    parser.add_argument('--no-com', action='store_true', help="Пропустить обновление через MS Word")
+    parser.add_argument('--fast', action='store_true', help="Быстрая сборка без запуска MS Word (не обновляет оглавление и формулы)")
     
     args = parser.parse_args()
     
@@ -626,4 +700,4 @@ if __name__ == '__main__':
     if not input_val:
         input_val = os.path.join(os.path.dirname(__file__), '..', '..', '.tmp', 'rewritten_guide_section1.md')
         
-    build_document(input_val, args.output, args.no_com, args.append)
+    build_document(input_val, args.output, args.fast, args.append)

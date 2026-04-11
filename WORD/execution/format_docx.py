@@ -83,7 +83,7 @@ def _insert_toc_before_intro(doc):
 #  Главная функция
 # ??????????????????????????????????????????????????????????????????
 
-def format_document(input_path, no_com=False):
+def format_document(input_path, fast=False):
     print(f"+ Читаем: {input_path}")
     doc = Document(input_path)
 
@@ -256,7 +256,7 @@ def format_document(input_path, no_com=False):
     wu.save_document_safe(doc, output)
 
     # ?? COM-обновление ????????????????????????????????????????????
-    if not no_com:
+    if not fast:
         wu.update_document_via_com(output)
 
 
@@ -266,7 +266,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Форматирование Word документов по ГОСТ")
     parser.add_argument('-i', '--input', required=True, help="Путь к файлу или папке для обработки")
     parser.add_argument('-o', '--output', default=None, help="Путь для сохранения результата")
-    parser.add_argument('--no-com', action='store_true', help="Пропустить обновление через MS Word")
+    parser.add_argument('--fast', action='store_true', help="Быстрая обработка без запуска MS Word (не обновляет поля)")
     
     args = parser.parse_args()
     
@@ -280,6 +280,6 @@ if __name__ == '__main__':
         from utils.docx_utils import find_working_files
         working_files = [f for f in files if "GOST" not in f and not os.path.basename(f).startswith("~")]
         for f in working_files:
-            format_document(f, args.no_com)
+            format_document(f, args.fast)
     else:
-        format_document(target, args.no_com)
+        format_document(target, args.fast)

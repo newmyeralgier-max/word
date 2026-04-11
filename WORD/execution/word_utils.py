@@ -10,9 +10,12 @@ import sys
 import re
 import glob
 import shutil
+from datetime import datetime
+from pathlib import Path
 
-from docx.shared import Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt, Cm, Mm, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.enum.section import WD_ORIENTATION, WD_SECTION
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from lxml import etree
@@ -97,11 +100,13 @@ def get_omml_xslt():
 
     # 1) Нет локальной копии -- ищем в Office и копируем
     if not os.path.exists(local):
+        pf = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        pf86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
         patterns = [
-            r"C:\Program Files\Microsoft Office\root\Office*\MML2OMML.XSL",
-            r"C:\Program Files (x86)\Microsoft Office\root\Office*\MML2OMML.XSL",
-            r"C:\Program Files\Microsoft Office\Office*\MML2OMML.XSL",
-            r"C:\Program Files (x86)\Microsoft Office\Office*\MML2OMML.XSL",
+            os.path.join(pf, r"Microsoft Office\root\Office*\MML2OMML.XSL"),
+            os.path.join(pf86, r"Microsoft Office\root\Office*\MML2OMML.XSL"),
+            os.path.join(pf, r"Microsoft Office\Office*\MML2OMML.XSL"),
+            os.path.join(pf86, r"Microsoft Office\Office*\MML2OMML.XSL"),
         ]
         source = None
         for pat in patterns:
@@ -216,27 +221,135 @@ def add_page_numbering(doc, *, smart_skip=True, align=WD_ALIGN_PARAGRAPH.RIGHT):
         add_page_field(run)
 
 
+def add_update_fields_setting(doc):
+    """Добавляет флаг принудительного обновления полей (TOC) при открытии документа в Word."""
+    settings = doc.settings.element
+    update_fields = OxmlElement('w:updateFields')
+    update_fields.set(qn('w:val'), 'true')
+    settings.append(update_fields)
+
 # ??????????????????????????????????????????????????????????????????
 #  Безопасное сохранение
 # ??????????????????????????????????????????????????????????????????
 
 def save_document_safe(doc, output_path):
-    """Сохранить с перехватом PermissionError (файл открыт в Word)."""
-    while True:
+    """Сохранить с перехватом PermissionError и добавлением флага обновления."""
+    import time
+    
+    # Автоматически добавляем флаг обновления полей при каждом сохранении
+    add_update_fields_setting(doc)
+
+    max_retries = 3
+    base_name, ext = os.path.splitext(output_path)
+    
+    for attempt in range(1, max_retries + 1):
         try:
             doc.save(output_path)
             print(f"\n[OK] Документ сохранён: {os.path.abspath(output_path)}")
             return True
         except PermissionError:
-            print(f"\n[!] Файл '{os.path.basename(output_path)}' открыт в другой программе!")
-            input("   Закройте его и нажмите Enter для повторной попытки...")
+            print(f"\n[!] Файл '{os.path.basename(output_path)}' открыт или занят. Попытка {attempt}/{max_retries}...")
+            if attempt < max_retries:
+                time.sleep(2)
+            else:
+                fallback_path = f"{base_name}_copy{ext}"
+                try:
+                    doc.save(fallback_path)
+                    print(f"\n[!] Удалось сохранить аварийную копию: {os.path.abspath(fallback_path)}")
+                    return True
+                except Exception as e:
+                    print(f"\n[!] Ошибка записи аварийной копии: {e}")
+                return False
+
+
+# ??????????????????????????????????????????????????????????????????
+#  Продвинутое форматирование таблиц и объектов
+# ??????????????????????????????????????????????????????????????????
+
+def set_table_border_gost(table):
+    """
+    Установить границы таблицы по ГОСТ (тонкие черные линии 0.5pt).
+    """
+    tbl = table._element
+    tblPr = tbl.xpath('w:tblPr')
+    if not tblPr:
+        tblPr = OxmlElement('w:tblPr')
+        tbl.insert(0, tblPr)
+    else:
+        tblPr = tblPr[0]
+
+    tblBorders = OxmlElement('w:tblBorders')
+    for border_name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
+        border = OxmlElement(f'w:{border_name}')
+        border.set(qn('w:val'), 'single')
+        border.set(qn('w:sz'), '4')  # 4 * 1/8 pt = 0.5 pt
+        border.set(qn('w:space'), '0')
+        border.set(qn('w:color'), '000000')
+        tblBorders.append(border)
+    
+    tblPr.append(tblBorders)
+
+
+def add_gost_caption(paragraph, label="Рисунок", text=""):
+    """
+    Добавить подпись по ГОСТ: 'Рисунок 1 — Название' или 'Таблица 1 — Название'.
+    Автоматически выставляет выравнивание и вставляет SEQ поле.
+    """
+    paragraph.clear()
+    
+    if label.lower() == "рисунок":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    else:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        paragraph.paragraph_format.first_line_indent = Cm(0)
+
+    run = paragraph.add_run(f"{label} ")
+    run.font.name = cfg.FONT_NAME
+    run.font.size = cfg.FONT_SIZE_MAIN
+    
+    add_seq_field(paragraph.add_run(), seq_name=label)
+    
+    suffix = f" — {text}" if text else ""
+    run_text = paragraph.add_run(suffix)
+    run_text.font.name = cfg.FONT_NAME
+    run_text.font.size = cfg.FONT_SIZE_MAIN
+
+
+def set_section_landscape(section):
+    """Переключить ориентацию секции в альбомную."""
+    new_width, new_height = section.page_height, section.page_width
+    section.orientation = WD_ORIENTATION.LANDSCAPE
+    section.page_width = new_width
+    section.page_height = new_height
+
+
+def remove_first_page_numbering(doc):
+    """Скрыть номер страницы на первом листе (титульнике)."""
+    for section in doc.sections:
+        section.different_first_page_header_footer = True
+        # Очищаем футер первой страницы, если там что-то было
+        section.first_page_footer.is_linked_to_previous = False
+        for p in section.first_page_footer.paragraphs:
+            p.text = ""
+
+
+def fix_list_indents(doc):
+    """
+    Исправить отступы всех списков на ГОСТовские (1.25см).
+    Word по умолчанию делает слишком большие отступы.
+    """
+    for para in doc.paragraphs:
+        if para.style.name.lower().startswith(('list', 'список')):
+            para.paragraph_format.left_indent = Cm(1.25)
+            para.paragraph_format.first_line_indent = Cm(-0.63) # Стандартный выступ для маркера
+
 
 
 # ??????????????????????????????????????????????????????????????????
 #  Word COM: обновление TOC + страницы
 # ??????????????????????????????????????????????????????????????????
 
-def update_document_via_com(output_path, *, visible=True):
+def update_document_via_com(output_path, *, visible=False):
     """Открывает документ через COM, обновляет поля, TOC, убирает жирность из TOC, сохраняет."""
     import win32com.client
 
@@ -244,7 +357,8 @@ def update_document_via_com(output_path, *, visible=True):
     word = None
     doc_com = None
     try:
-        word = win32com.client.Dispatch("Word.Application")
+        # Используем DispatchEx для запуска независимого процесса Word
+        word = win32com.client.DispatchEx("Word.Application")
         word.Visible = visible
         word.DisplayAlerts = 0          # wdAlertsNone
 
@@ -260,15 +374,40 @@ def update_document_via_com(output_path, *, visible=True):
         print("[OK] Оглавление и нумерация обновлены MS Word!")
 
     except Exception as e:
-        print(f"[!]? Ошибка Word COM: {e}")
+        print(f"[!] Ошибка Word COM: {e}")
+    finally:
         if doc_com:
             try:
                 doc_com.Close(False)
             except Exception:
                 pass
-    finally:
         if word:
             try:
                 word.DisplayAlerts = -1     # wdAlertsAll
+                word.Quit()
             except Exception:
                 pass
+
+
+# ??????????????????????????????????????????????????????????????????
+#  Файловые операции и логирование
+# ??????????????????????????????????????????????????????????????????
+
+def create_backup(filepath: str) -> str:
+    """Создаёт резервную копию файла с временной меткой."""
+    path = Path(filepath)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_name = f"backup_{timestamp}_{path.name}"
+    backup_path = path.parent / backup_name
+    shutil.copy2(filepath, backup_path)
+    return str(backup_path)
+
+
+def log_operation(operation: str, details: str, log_dir: str = ".tmp"):
+    """Логирует операцию в файл."""
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "operations.log")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {operation}: {details}\n")
+

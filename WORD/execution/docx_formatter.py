@@ -20,7 +20,8 @@ from docx.shared import Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 
 sys.path.insert(0, str(Path(__file__).parent))
-from utils.docx_utils import create_backup, log_operation
+import word_utils as wu
+import word_config as cfg
 
 
 # Стандартные настройки ГОСТ для учебных/технических документов
@@ -91,41 +92,24 @@ def extract_styles_from_reference(ref_doc: Document) -> dict:
 
 
 def apply_gost_formatting(doc: Document):
-    """Применяет стандартные настройки ГОСТ к документу."""
-    s = GOST_SETTINGS
-
-    # Настройки страницы
+    """Применяет стандартные настройки ГОСТ к документу через объединенные утилиты."""
+    # 1. Настройка основных стилей (Normal, Heading 1-3)
+    wu.setup_gost_styles(doc)
+    
+    # 2. Настройки страницы
     for section in doc.sections:
-        section.top_margin = s["margin_top"]
-        section.bottom_margin = s["margin_bottom"]
-        section.left_margin = s["margin_left"]
-        section.right_margin = s["margin_right"]
+        section.top_margin = cfg.MARGIN_TOP
+        section.bottom_margin = cfg.MARGIN_BOTTOM
+        section.left_margin = cfg.MARGIN_LEFT
+        section.right_margin = cfg.MARGIN_RIGHT
 
-    # Форматирование параграфов
-    for para in doc.paragraphs:
-        style_name = para.style.name if para.style else "Normal"
+    # 3. Применение специфичных фиксов из Phase 2
+    wu.fix_list_indents(doc)
+    wu.remove_first_page_numbering(doc)
+    
+    # 4. Нумерация страниц (кроме первой)
+    wu.add_page_numbering(doc, smart_skip=True)
 
-        if "heading" in style_name.lower():
-            # Заголовки
-            para.alignment = s["alignment_heading"]
-            level = 1 if "1" in style_name else 2
-            target_size = s["font_size_heading1"] if level == 1 else s["font_size_heading2"]
-            for run in para.runs:
-                run.font.name = s["font_name"]
-                run.font.size = target_size
-                run.bold = True
-        else:
-            # Основной текст
-            para.alignment = s["alignment_body"]
-            pf = para.paragraph_format
-            pf.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
-            pf.space_after = s["space_after"]
-            pf.space_before = s["space_before"]
-            if para.text.strip():
-                pf.first_line_indent = s["first_line_indent"]
-            for run in para.runs:
-                run.font.name = s["font_name"]
-                run.font.size = s["font_size_body"]
 
 
 def apply_reference_formatting(doc: Document, ref_styles: dict):
@@ -197,7 +181,7 @@ def main():
 
     # Бэкап
     if not args.no_backup:
-        backup = create_backup(str(target_path))
+        backup = wu.create_backup(str(target_path))
         print(f"✅ Резервная копия: {backup}")
 
     doc = Document(str(target_path))
@@ -217,11 +201,15 @@ def main():
         mode = "по стандарту ГОСТ"
 
     save_path = args.save_as if args.save_as else str(target_path)
-    doc.save(save_path)
+    wu.save_document_safe(doc, save_path)
+
+    # После сохранения обновляем TOC через Word COM
+    wu.update_document_via_com(save_path)
 
     print(f"\n✅ Документ отформатирован {mode}")
     print(f"📄 Сохранено: {save_path}")
-    log_operation("docx_formatter", f"Файл: {target_path.name}, Режим: {mode}")
+    wu.log_operation("docx_formatter", f"Файл: {target_path.name}, Режим: {mode}")
+
 
 
 if __name__ == "__main__":

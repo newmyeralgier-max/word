@@ -83,7 +83,7 @@ def _insert_toc_before_intro(doc):
 #  Главная функция
 # ??????????????????????????????????????????????????????????????????
 
-def format_document(input_path, fast=False):
+def format_document(input_path, fast=False, legacy=False):
     print(f"+ Читаем: {input_path}")
     doc = Document(input_path)
 
@@ -197,12 +197,15 @@ def format_document(input_path, fast=False):
             continue
 
         # Подписи к рисункам/таблицам
-        if re.match(r'^(Рисунок|Таблица|Продолжение\s*таблицы)\s*\d+', text, re.I):
+        cap_regex = r'^(Рисунок|Рис\.|Таблица|Продолжение\s*таблицы)\s*\d+' if legacy else r'^(Рисунок|Таблица|Продолжение\s*таблицы)\s*\d+'
+        
+        if re.match(cap_regex, text, re.I):
             p.paragraph_format.first_line_indent = Cm(0)
-            if text.lower().startswith('рисунок'):
+            if text.lower().startswith('рисунок') or text.lower().startswith('рис.'):
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             else:
-                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                # Таблицы: Modern - Left, Legacy - Right
+                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT if legacy else WD_ALIGN_PARAGRAPH.LEFT
             p.paragraph_format.space_before = Pt(0)
             p.paragraph_format.space_after  = Pt(0)
         else:
@@ -267,6 +270,7 @@ if __name__ == '__main__':
     parser.add_argument('-i', '--input', required=True, help="Путь к файлу или папке для обработки")
     parser.add_argument('-o', '--output', default=None, help="Путь для сохранения результата")
     parser.add_argument('--fast', action='store_true', help="Быстрая обработка без запуска MS Word (не обновляет поля)")
+    parser.add_argument('--legacy', action='store_true', help="Использовать старый стиль оформления (Рис. вместо Рисунок, точки вместо тире)")
     
     args = parser.parse_args()
     
@@ -276,10 +280,10 @@ if __name__ == '__main__':
         sys.exit(1)
         
     if os.path.isdir(target):
+        import glob
         files = glob.glob(os.path.join(target, "*.docx"))
-        from utils.docx_utils import find_working_files
         working_files = [f for f in files if "GOST" not in f and not os.path.basename(f).startswith("~")]
         for f in working_files:
-            format_document(f, args.fast)
+            format_document(f, args.fast, legacy=args.legacy)
     else:
-        format_document(target, args.fast)
+        format_document(target, args.fast, legacy=args.legacy)

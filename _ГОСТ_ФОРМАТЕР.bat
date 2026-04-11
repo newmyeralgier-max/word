@@ -2,12 +2,13 @@
 setlocal enabledelayedexpansion
 title Ultimate GOST-Formatter
 
+:: Устанавливаем путь к Python. Если он не найдется по этому пути, скрипт будет искать его в системных переменных PATH
 set "PYTHON_EXEC=C:\Users\New-life\AppData\Local\Programs\Python\Python313\python.exe"
-:: Fallback to python in PATH
 if not exist "%PYTHON_EXEC%" (
     set "PYTHON_EXEC=python"
 )
 
+:: Указываем пути к нашим Python-скриптам относительно расположения этого .bat файла
 set "BUILD_SCRIPT=%~dp0WORD\execution\build_docx.py"
 set "FORMAT_SCRIPT=%~dp0WORD\execution\format_docx.py"
 
@@ -30,11 +31,13 @@ if "%~1"=="" (
     if "!choice!"=="1" (
         set /p filepath="Enter or drag-and-drop the path to .md file: "
         set "filepath=!filepath:"=!"
-        "%PYTHON_EXEC%" "%BUILD_SCRIPT%" "!filepath!"
+        :: ИСПРАВЛЕНИЕ: Добавлен флаг -i перед путем к файлу
+        "%PYTHON_EXEC%" "%BUILD_SCRIPT%" -i "!filepath!"
     ) else if "!choice!"=="2" (
         set /p filepath="Enter or drag-and-drop the path to .docx file: "
         set "filepath=!filepath:"=!"
-        "%PYTHON_EXEC%" "%FORMAT_SCRIPT%" "!filepath!"
+        :: ИСПРАВЛЕНИЕ: Добавлен флаг -i перед путем к файлу
+        "%PYTHON_EXEC%" "%FORMAT_SCRIPT%" -i "!filepath!"
     ) else (
         echo Invalid choice!
     )
@@ -50,10 +53,12 @@ set "FILE_EXT=%~x1"
 
 if /i "%FILE_EXT%"==".md" (
     echo [~] Building Markdown: %~n1%FILE_EXT%
-    "%PYTHON_EXEC%" "%BUILD_SCRIPT%" "%~1"
+    :: ИСПРАВЛЕНИЕ: Добавлен флаг -i для Drag-and-Drop
+    "%PYTHON_EXEC%" "%BUILD_SCRIPT%" -i "%~1"
 ) else if /i "%FILE_EXT%"==".docx" (
     echo [~] Formatting Word: %~n1%FILE_EXT%
-    "%PYTHON_EXEC%" "%FORMAT_SCRIPT%" "%~1"
+    :: ИСПРАВЛЕНИЕ: Добавлен флаг -i для Drag-and-Drop
+    "%PYTHON_EXEC%" "%FORMAT_SCRIPT%" -i "%~1"
 ) else (
     echo [!] SKIPPED: Unknown format %FILE_EXT% ^(%~nx1^)
 )

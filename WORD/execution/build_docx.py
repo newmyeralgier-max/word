@@ -7,7 +7,7 @@ build_docx.py -- Сборка ГОСТ-документа из Markdown-файл
 * Мультифайловая сборка
 """
 
-import sys, os, re, glob, argparse
+import sys, os, re, glob, argparse, random
 
 # ?? Путь к модулям рядом ??????????????????????????????????????????
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +22,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn, nsdecls
 from docx.oxml import parse_xml, OxmlElement
+from docx.enum.section import WD_ORIENT
 
 from pygments import lex
 from pygments.lexers import get_lexer_by_name, guess_lexer
@@ -152,38 +153,46 @@ def _set_cell_border(cell):
     ))
 
 
-def _add_table_caption(doc, text, h1_idx=0):
-    """Подпись таблицы (две строки: номер справа, название по центру)."""
+def _add_table_caption(doc, text, h1_idx=0, legacy=False):
+    """Подпись таблицы. Modern: слева в одну строку. Legacy: номер справа, название по центру."""
     clean_caption = re.sub(r'^(?:\*?Таблица\s*[\d\.]*|\*?Таблица)\s*(?:--|-|—)?\s*', '', text.strip('* '))
     
-    # 1. Номер (справа)
-    p1 = doc.add_paragraph()
-    _apply_p_format(p1, align=WD_ALIGN_PARAGRAPH.RIGHT, space_before=Pt(12), keep_next=True)
-    
-    if h1_idx > 0:
-        run1 = p1.add_run(f"Таблица {h1_idx}.")
-    else:
-        run1 = p1.add_run("Таблица ")
-    run1.font.name = cfg.FONT_NAME
-    run1.font.size = cfg.FONT_SIZE_MAIN
-    seq_name = f"Таблица_{h1_idx}" if h1_idx > 0 else "Таблица"
-    wu.add_seq_field(run1, seq_name)
-    
-    # 2. Название (по центру)
-    if clean_caption:
-        p2 = doc.add_paragraph()
-        _apply_p_format(p2, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=Pt(6), keep_next=True)
+    if legacy:
+        # Старый стиль: номер справа, текст центром
+        p1 = doc.add_paragraph()
+        _apply_p_format(p1, align=WD_ALIGN_PARAGRAPH.RIGHT, space_before=Pt(12), keep_next=True)
+        run1 = p1.add_run(f"Таблица {h1_idx}." if h1_idx > 0 else "Таблица ")
+        run1.font.name = cfg.FONT_NAME
+        run1.font.size = cfg.FONT_SIZE_MAIN
+        wu.add_seq_field(run1, "Таблица")
         
-        run2 = p2.add_run(clean_caption)
-        run2.font.name = cfg.FONT_NAME
-        run2.font.size = cfg.FONT_SIZE_MAIN
-        return p2
-    return p1
+        if clean_caption:
+            p2 = doc.add_paragraph()
+            _apply_p_format(p2, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=Pt(6), keep_next=True)
+            run2 = p2.add_run(clean_caption)
+            run2.font.name = cfg.FONT_NAME
+            run2.font.size = cfg.FONT_SIZE_MAIN
+            return p2
+        return p1
+    else:
+        # Современный ГОСТ 7.32: Слева, в одну строку через тире
+        p = doc.add_paragraph()
+        _apply_p_format(p, align=WD_ALIGN_PARAGRAPH.LEFT, space_before=Pt(12), space_after=Pt(6), first_line_ind=Cm(0))
+        run = p.add_run(f"Таблица {h1_idx}" if h1_idx > 0 else "Таблица")
+        run.font.name = cfg.FONT_NAME
+        run.font.size = cfg.FONT_SIZE_MAIN
+        wu.add_seq_field(run, "Таблица")
+        
+        if clean_caption:
+            run2 = p.add_run(f" — {clean_caption}")
+            run2.font.name = cfg.FONT_NAME
+            run2.font.size = cfg.FONT_SIZE_MAIN
+        return p
 
 
-def _add_table(doc, header_cells, data_rows, caption="", h1_idx=0):
+def _add_table(doc, header_cells, data_rows, caption="", h1_idx=0, legacy=False):
     if caption:
-        _add_table_caption(doc, caption, h1_idx)
+        _add_table_caption(doc, caption, h1_idx, legacy=legacy)
 
     ncols = len(header_cells)
     table = doc.add_table(rows=len(data_rows) + 1, cols=ncols)
@@ -200,6 +209,11 @@ def _add_table(doc, header_cells, data_rows, caption="", h1_idx=0):
         _add_rich_text_to_paragraph(p, txt, font_size=cfg.FONT_SIZE_TABLE)
         _set_cell_border(cell)
 
+    # Задача 1: Повторение шапки таблицы на новых страницах (ГОСТ)
+    tr = table.rows[0]._tr
+    trPr = tr.get_or_add_trPr()
+    trPr.append(parse_xml(f'<w:tblHeader {nsdecls("w")}/>'))
+
     for i, row in enumerate(data_rows):
         for j in range(ncols):
             cell = table.cell(i + 1, j)
@@ -207,6 +221,18 @@ def _add_table(doc, header_cells, data_rows, caption="", h1_idx=0):
             p.paragraph_format.first_line_indent = 0
             _add_rich_text_to_paragraph(p, row[j], font_size=cfg.FONT_SIZE_TABLE)
             _set_cell_border(cell)
+
+    # Задача 2: Пост-обработка: Слияние ячеек (Colspan / Rowspan)
+    for i in range(len(table.rows)):
+        for j in range(len(table.columns)):
+            cell = table.cell(i, j)
+            text = cell.text.strip()
+            if text == '>' and j > 0:
+                table.cell(i, j-1).merge(cell)
+                cell.text = '' # Очищаем маркер
+            elif text == '^' and i > 0:
+                table.cell(i-1, j).merge(cell)
+                cell.text = '' # Очищаем маркер
 
     spacer = doc.add_paragraph()
     spacer.paragraph_format.space_before = Pt(6)
@@ -218,25 +244,31 @@ def _add_table(doc, header_cells, data_rows, caption="", h1_idx=0):
 #  Вспомогательные: изображения и подписи
 # ??????????????????????????????????????????????????????????????????
 
-def _add_figure_caption(doc, text, h1_idx=0):
-    clean_caption = re.sub(r'^(?:\*?Рисунок\s*[\d\.]*|\*?Рисунок)\s*(?:--|-|—)?\s*', '', text.strip('* '))
+def _add_figure_caption(doc, text, h1_idx=0, legacy=False):
+    """Подпись рисунка. Modern: Рисунок 1 — Название. Legacy: Рис. 1. Название."""
+    clean_caption = re.sub(r'^(?:\*?Рисунок\s*[\d\.]*|\*?Рисунок|\*?Рис\.)\s*(?:--|-|—)?\s*', '', text.strip('* '))
     p = doc.add_paragraph()
     _apply_p_format(p, align=WD_ALIGN_PARAGRAPH.CENTER, space_before=Pt(6), space_after=Pt(12))
     
-    if h1_idx > 0:
-        run = p.add_run(f"Рис. {h1_idx}.")
-    else:
-        run = p.add_run("Рис. ")
-
+    label = "Рис. " if legacy else "Рисунок "
+    sep = ". " if legacy else " — "
+    
+    run = p.add_run(f"{label}{h1_idx}." if h1_idx > 0 else label)
     run.font.name = cfg.FONT_NAME
     run.font.size = cfg.FONT_SIZE_MAIN
-    seq_name = f"Рисунок_{h1_idx}" if h1_idx > 0 else "Рисунок"
-    wu.add_seq_field(run, seq_name)
+    wu.add_seq_field(run, f"Рисунок_{h1_idx}" if h1_idx > 0 else "Рисунок")
     
     if clean_caption:
-        # Убираем возможные начальные точки/тире из названия и добавляем точку в конце
         clean_text = re.sub(r'^[.\s—–-]+', '', clean_caption).strip()
-        run2 = p.add_run(f". {clean_text}.")
+        
+        # Задача 4: Ищем закладку: {#имя}
+        b_match = re.search(r'\{#([a-zA-Z0-9_-]+)\}', clean_text)
+        if b_match:
+            _add_bookmark(p, b_match.group(1))
+            clean_text = clean_text.replace(b_match.group(0), '').strip()
+
+        run2 = p.add_run(f"{sep}{clean_text}")
+        if legacy: run2.add_text(".") # Точка в конце только в legacy
         run2.font.name = cfg.FONT_NAME
         run2.font.size = cfg.FONT_SIZE_MAIN
 
@@ -395,6 +427,38 @@ def _auto_wrap_subscripts(text):
     return ''.join(parts)
 
 
+def _add_bookmark(paragraph, bookmark_name):
+    """Добавляет невидимую закладку в абзац (Задача 4)."""
+    b_id = str(random.randint(10000, 99999))
+    start = OxmlElement('w:bookmarkStart')
+    start.set(qn('w:id'), b_id)
+    start.set(qn('w:name'), bookmark_name)
+    paragraph._element.insert(0, start)
+    end = OxmlElement('w:bookmarkEnd')
+    end.set(qn('w:id'), b_id)
+    paragraph._element.append(end)
+
+def _add_ref_field(paragraph, bookmark_name):
+    """Вставляет кликабельное поле REF на закладку (Задача 4)."""
+    run = paragraph.add_run()
+    run.font.name = cfg.FONT_NAME
+    run.font.size = cfg.FONT_SIZE_MAIN
+    
+    fldChar1 = OxmlElement('w:fldChar')
+    fldChar1.set(qn('w:fldCharType'), 'begin')
+    instrText = OxmlElement('w:instrText')
+    instrText.set(qn('xml:space'), 'preserve')
+    instrText.text = f' REF {bookmark_name} \\h '
+    fldChar2 = OxmlElement('w:fldChar')
+    fldChar2.set(qn('w:fldCharType'), 'separate')
+    t = OxmlElement('w:t')
+    t.text = '[ссылка]' # Заглушка, обновится при Ctrl+A -> F9
+    fldChar3 = OxmlElement('w:fldChar')
+    fldChar3.set(qn('w:fldCharType'), 'end')
+    
+    for el in [fldChar1, instrText, fldChar2, t, fldChar3]:
+        run._r.append(el)
+
 def _add_rich_text_to_paragraph(paragraph, text, font_size=None):
     """
     Разбор текста с поддержкой:
@@ -409,8 +473,8 @@ def _add_rich_text_to_paragraph(paragraph, text, font_size=None):
 
     text = _auto_wrap_subscripts(text)
     
-    # Регулярка для деления на токены
-    token_re = re.compile(r'(\*\*.*?\*\*|\*[^*]+?\*|`[^`]+?`|\$[^$]+?\$)')
+    # Регулярка для деления на токены (Задача 4: добавлен [@...])
+    token_re = re.compile(r'(\*\*.*?\*\*|\*[^*]+?\*|`[^`]+?`|\$[^$]+?\$|\[@[a-zA-Z0-9_-]+\])')
     
     for part in token_re.split(text):
         if not part:
@@ -432,6 +496,8 @@ def _add_rich_text_to_paragraph(paragraph, text, font_size=None):
             run.font.size = cfg.FONT_SIZE_CODE
         elif part.startswith('$') and part.endswith('$'):
             _add_inline_math(paragraph, part[1:-1])
+        elif part.startswith('[@') and part.endswith(']'):
+            _add_ref_field(paragraph, part[2:-1])
         else:
             run = paragraph.add_run(part)
             run.font.name = cfg.FONT_NAME
@@ -501,7 +567,7 @@ def _read_inputs(input_path):
 #  Главная сборка
 # ??????????????????????????????????????????????????????????????????
 
-def build_document(input_path, output=None, fast=False, append_doc_path=None):
+def build_document(input_path, output=None, fast=False, append_doc_path=None, legacy=False):
     if not os.path.exists(input_path):
         print(f"[!] Путь не найден: {input_path}")
         return
@@ -556,6 +622,19 @@ def build_document(input_path, output=None, fast=False, append_doc_path=None):
         if tp == 'paragraph':
             raw = _flat_text(node).strip()
 
+            # Задача 3: Альбомная ориентация
+            if raw == '<!-- LANDSCAPE_START -->':
+                new_section = doc.add_section()
+                new_section.orientation = WD_ORIENT.LANDSCAPE
+                new_section.page_width, new_section.page_height = new_section.page_height, new_section.page_width
+                continue
+
+            if raw == '<!-- LANDSCAPE_END -->':
+                new_section = doc.add_section()
+                new_section.orientation = WD_ORIENT.PORTRAIT
+                new_section.page_width, new_section.page_height = new_section.page_height, new_section.page_width
+                continue
+
             if raw.upper() in ('[TOC]', '[[TOC]]'):
                 _add_toc(doc)
                 continue
@@ -569,7 +648,7 @@ def build_document(input_path, output=None, fast=False, append_doc_path=None):
                     found_images = glob.glob(os.path.join(images_dir, f'fig{fig_num}.*'))
                     if found_images:
                         _add_image_centered(doc, found_images[0])
-                _add_figure_caption(doc, caption_text, current_h1_idx)
+                _add_figure_caption(doc, caption_text, current_h1_idx, legacy=legacy)
                 continue
 
             # Формулы
@@ -601,7 +680,7 @@ def build_document(input_path, output=None, fast=False, append_doc_path=None):
                     tp = 'table'
                     node['_caption'] = caption_text
                 else:
-                    _add_table_caption(doc, caption_text, current_h1_idx)
+                    _add_table_caption(doc, caption_text, current_h1_idx, legacy=legacy)
                     continue
 
             if tp == 'paragraph' and 'children' in node and node['children']:
@@ -642,14 +721,14 @@ def build_document(input_path, output=None, fast=False, append_doc_path=None):
                         for row in child.get('children', []):
                             data_rows.append([_flat_text(c) for c in row.get('children', [])])
             if header_cells:
-                _add_table(doc, header_cells, data_rows, caption, current_h1_idx)
+                _add_table(doc, header_cells, data_rows, caption, current_h1_idx, legacy=legacy)
             continue
 
         if tp == 'list':
             ordered = node.get('attrs', {}).get('ordered', False)
             for li_idx, item in enumerate(node.get('children', [])):
                 text = _flat_text(item).strip()
-                prefix = f"{li_idx + 1}. " if ordered else "-- "
+                prefix = f"{li_idx + 1}. " if ordered else ("-- " if legacy else "— ")
                 _add_rich_paragraph(doc, _auto_wrap_subscripts(prefix + text))
             continue
 
@@ -693,6 +772,7 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', help="Путь для сохранения", default=None)
     parser.add_argument('-a', '--append', help="Путь к существующему Word-документу, в конец которого нужно дописать текст", default=None)
     parser.add_argument('--fast', action='store_true', help="Быстрая сборка без запуска MS Word (не обновляет оглавление и формулы)")
+    parser.add_argument('--legacy', action='store_true', help="Использовать старый стиль оформления (Рис. вместо Рисунок, точки вместо тире)")
     
     args = parser.parse_args()
     
@@ -700,4 +780,4 @@ if __name__ == '__main__':
     if not input_val:
         input_val = os.path.join(os.path.dirname(__file__), '..', '..', '.tmp', 'rewritten_guide_section1.md')
         
-    build_document(input_val, args.output, args.fast, args.append)
+    build_document(input_val, args.output, args.fast, args.append, legacy=args.legacy)

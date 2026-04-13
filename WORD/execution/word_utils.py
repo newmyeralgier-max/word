@@ -25,27 +25,43 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import word_config as cfg
 
 
+# ──────────────────────────────────────────────────────────────────
+#  Форматирование абзацев
+# ──────────────────────────────────────────────────────────────────
+
+def apply_p_format(p, align=None, left_ind=Cm(0), right_ind=Cm(0), first_line_ind=Cm(0), 
+                   space_before=Pt(0), space_after=Pt(0), keep_next=False, 
+                   line_spacing=cfg.LINE_SPACING):
+    """Универсальная настройка формата абзаца."""
+    if align is not None:
+        p.alignment = align
+    p.paragraph_format.left_indent = left_ind
+    p.paragraph_format.right_indent = right_ind
+    p.paragraph_format.first_line_indent = first_line_ind
+    p.paragraph_format.space_before = space_before
+    p.paragraph_format.space_after = space_after
+    p.paragraph_format.keep_with_next = keep_next
+    # В docx line_spacing может быть числом или объектом WD_LINE_SPACING
+    p.paragraph_format.line_spacing = line_spacing
+
+
 # ??????????????????????????????????????????????????????????????????
 #  ГОСТ-стили
 # ??????????????????????????????????????????????????????????????????
 
 def setup_gost_styles(doc):
-    """Настроить встроенные стили Word под ГОСТ 7.32 (Normal, Heading 1-3, TOC 1-3)."""
-
-    # ?? Normal ??????????????????????????????????????????????????
-    sn = doc.styles['Normal']
-    sn.font.name      = cfg.FONT_NAME
-    sn.font.size      = cfg.FONT_SIZE_MAIN
-    sn.font.color.rgb  = cfg.COLOR_BLACK
-    pf = sn.paragraph_format
-    pf.space_before       = Pt(0)
-    pf.space_after        = Pt(0)
-    pf.line_spacing       = cfg.LINE_SPACING
-    pf.first_line_indent  = cfg.FIRST_LINE_INDENT
-    pf.alignment          = WD_ALIGN_PARAGRAPH.JUSTIFY
-    pf.widow_control      = True
-
-    # ?? Heading 1-3 (английское + русское имя) ??????????????????
+    """Настроить встроенные стили Word под ГОСТ 7.32.
+    ★ ФИКС H: НЕ меняем стиль Normal глобально — это ломает титульник и задание.
+    Normal применяется ко всему документу через наследование.
+    Вместо этого задаём ГОСТ-параметры только на Heading и TOC."""
+    
+    # ★ ФИКС H: НЕ трогаем Normal — он используется в титульнике/задании
+    # ГОСТ-параметры для body-текста ставятся через _clear_indents_and_set
+    # на каждый абзац в основной зоне, а не через стиль Normal
+    # Старый код ломал титульник: Normal.line_spacing=1.5 растягивал ВСЁ
+    # Включая задание (Body Text 3 наследует от Normal)
+    
+    # ── Heading 1-3 (английское + русское имя) ────────────────────
     bold_map = {1: cfg.BOLD_H1, 2: cfg.BOLD_H2, 3: cfg.BOLD_H3}
     size_map = {1: cfg.FONT_SIZE_H1, 2: cfg.FONT_SIZE_H2, 3: cfg.FONT_SIZE_H3}
 

@@ -1,47 +1,242 @@
 """
-format_docx.py -- Неразрушающий ГОСТ-форматер для готовых Word-документов.
+format_docx.py — ГОСТ-форматер для Word-документов.
+Версия 3.2 — Фиксы по скринам недочётов БР.
 
-Принимает .docx ? анализирует абзацы ? применяет ГОСТ-стили.
-Защищает: титульный лист, авторскую верстку, таблицы, списки, формулы.
-Все токены -- из word_config.py, утилиты -- из word_utils.py.
+Принципы:
+  1. НЕ разрушаем содержимое — модифицируем runs, а не перезаписываем p.text
+  2. Опираемся на СТИЛИ Word, а не на хрупкие эвристики по тексту
+  3. Строго следуем word_config.py — единый источник правды
+  4. Разрыв страницы перед заголовками H1 — требование ГОСТ
+
+v3.2 фиксы:
+  ФИКС 7: ВВЕДЕНИЕ в стиле Title → STRUCTURAL_H1 (не иммунитет)
+  ФИКС 8: "1.ТЕКСТ" без пробела — распознаётся как заголовок
+  ФИКС 9: Формулы — очистка TAB в runs перед установкой tab stops
+  ФИКС 10: Точка в конце заголовков — удаляется
+  ФИКС 11: Пустые OMML-параграфы — удаляются
+  ФИКС 12: "Таблица 4.1." — точка после номера срезается
+  ФИКС 13: Стили HTML Preformatted/Normal (Web) → Body Text
+  ФИКС 14: Удаление пустых страниц в хвосте (приложения)
 """
 
-import sys, os, re
+import sys, os, re, copy
+from docx import Document
+from docx.shared import Pt, Cm, Mm, Emu
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_LINE_SPACING
+from docx.oxml.ns import qn, nsdecls
+from docx.oxml import parse_xml, OxmlElement
 
-# ?? Путь к модулям рядом ??????????????????????????????????????????
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import word_config as cfg
 import word_utils  as wu
 
-from docx import Document
-from docx.shared import Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+
+# ──────────────────────────────────────────────────────────────────
+#  Константы детекции
+# ──────────────────────────────────────────────────────────────────
+
+# Структурные элементы ГОСТ — всегда по центру, без нумерации, КАПСОМ
+STRUCTURAL_KEYWORDS = {
+    'ВВЕДЕНИЕ', 'ЗАКЛЮЧЕНИЕ', 'СОДЕРЖАНИЕ', 'ОГЛАВЛЕНИЕ',
+    'СПИСОК ЛИТЕРАТУРЫ', 'СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ',
+    'СПИСОК ИСПОЛЬЗОВАННОЙ ЛИТЕРАТУРЫ',
+    'РЕФЕРАТ', 'АННОТАЦИЯ', 'ЗАДАНИЕ',
+    'ОПРЕДЕЛЕНИЯ', 'ОБОЗНАЧЕНИЯ И СОКРАЩЕНИЯ',
+    'ПРИЛОЖЕНИЕ', 'ПРИЛОЖЕНИЯ',
+}
+
+# Ключевые слова, после которых начинается основная зона текста
+MAIN_ZONE_TRIGGERS = STRUCTURAL_KEYWORDS
+
+# Паттерн подписи к рисунку
+_RE_FIGURE = re.compile(
+    r'^(Рис\.|Рисунок)\s*(\d+[\.\d]*)\s*[.\s—–\-]*\s*(.*)', re.I
+)
+# Паттерн подписи к таблице
+# ★ ФИКС 12: "Таблица 4.1." — точка после номера срезается
+_RE_TABLE_CAP = re.compile(
+    r'^(Табл\.|Таблица)\s*(\d+(?:\.\d+)?)\.?\s*[.\s—–\-]*\s*(.*)', re.I
+)
+# Паттерн нумерации формулы в конце строки: (1), (1.1), (2.3.4)
+_RE_FORMULA_NUM = re.compile(r'\((\d+[\.\d]*)\)\s*$')
+# Паттерн маркированного списка
+_RE_LIST_PREFIX = re.compile(r'^[-—–•]\s+')
+# Паттерн нумерованного списка: а), б), 1), 2)
+_RE_NUM_LIST = re.compile(r'^([а-яёА-ЯЁ]\)|\d+\))\s+')
+# Паттерн заголовка раздела: "1. ТЕКСТ ЗАГЛАВНЫМИ" или "1.1 ТЕКСТ ЗАГЛАВНЫМИ"
+_RE_SECTION_HEADING = re.compile(r'^(\d+(?:\.\d+)?)\s+[\-—]?\s*([А-ЯЁ]{2,}|[А-ЯЁ].*[А-ЯЁ])')
+# Паттерн «где» — расшифровка формулы
+_RE_WHERE_LINE = re.compile(r'^где\s+', re.I)
+# Ключевые слова начала библиографии
+_BIBLIO_KEYWORDS = {
+    'СПИСОК ЛИТЕРАТУРЫ', 'СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ',
+    'СПИСОК ИСПОЛЬЗОВАННОЙ ЛИТЕРАТУРЫ',
+}
+
+# Счётчик заголовков из List Paragraph (ФИКС 15)
+_lp_heading_counter = [0]
 
 
-# ??????????????????????????????????????????????????????????????????
-#  Умная вставка TOC
-# ??????????????????????????????????????????????????????????????????
+# ──────────────────────────────────────────────────────────────────
+#  Вспомогательные функции
+# ──────────────────────────────────────────────────────────────────
+
+def _set_run_font(run, font_name=cfg.FONT_NAME, font_size=cfg.FONT_SIZE_MAIN,
+                  bold=None, italic=None, color=cfg.COLOR_BLACK):
+    """Безопасно установить шрифт run, не трогая моноширинные (код).
+    ★ ФИКС A: НЕ перезаписываем size если он None — наследование от стиля важнее.
+    ★ Если font_size=None — вообще не трогаем размер run."""
+    # Не трогаем шрифт кода
+    if run.font.name and run.font.name.lower() in ('consolas', 'courier new'):
+        return
+    # ★ ГОСТ требует TNR — ставим всегда
+    run.font.name  = font_name
+    # ★ ФИКС A: Если font_size=None — не трогаем размер (наследуется от стиля)
+    # Если font_size задан — ставим ТОЛЬКО если run.font.size уже был задан явно (не None)
+    # Если run.font.size is None (наследуется) — тоже не перезаписываем, стиль знает лучше
+    if font_size is not None and run.font.size is not None:
+        run.font.size  = font_size
+    if bold   is not None: run.bold   = bold
+    if italic is not None: run.italic = italic
+    if color  is not None: run.font.color.rgb = color
+
+
+def _clear_indents_and_set(p, align=None, first_line_ind=None,
+                           left_ind=Cm(0), right_ind=Cm(0),
+                           space_before=Pt(0), space_after=Pt(0),
+                           line_spacing=cfg.LINE_SPACING,
+                           keep_next=False, widow=True):
+    """Установить формат абзаца, сбросив лишние отступы."""
+    pf = p.paragraph_format
+    if align is not None:
+        p.alignment = align
+    pf.left_indent        = left_ind
+    pf.right_indent       = right_ind
+    pf.first_line_indent  = first_line_ind if first_line_ind is not None else Cm(0)
+    pf.space_before       = space_before
+    pf.space_after        = space_after
+    pf.line_spacing       = line_spacing
+    pf.keep_with_next     = keep_next
+    pf.widow_control      = widow
+
+
+def _has_page_break_before(p):
+    """Проверить, есть ли уже разрыв страницы перед этим параграфом."""
+    # ★ БАГ 13: Проверяем pageBreakBefore в свойствах текущего параграфа
+    pPr = p._element.find(qn('w:pPr'))
+    if pPr is not None and pPr.find(qn('w:pageBreakBefore')) is not None:
+        return True
+    prev = p._element.getprevious()
+    while prev is not None:
+        # Проверяем: содержит ли предыдущий элемент разрыв страницы
+        # ★ ФИКС: Используем qn() для неймспейсов вместо прямого XPath
+        breaks = prev.findall('.//' + qn('w:br'))
+        page_breaks = [br for br in breaks 
+                       if br.get(qn('w:type')) == 'page']
+        if page_breaks:
+            return True
+        # Если предыдущий параграф пустой — продолжаем искать
+        text_el = prev.findall('.//' + qn('w:t'))
+        text = ''.join(t.text or '' for t in text_el).strip()
+        if not text:
+            prev = prev.getprevious()
+            continue
+        break
+    return False
+
+
+def _remove_empty_paragraphs_before(p):
+    """Удалить пустые параграфы непосредственно перед данным."""
+    removed = 0
+    while True:
+        prev_el = p._element.getprevious()
+        if prev_el is None:
+            break
+        # Это параграф?
+        if prev_el.tag != qn('w:p') and not prev_el.tag.endswith('}p'):
+            break
+        text_el = prev_el.xpath('.//w:t')
+        text = ''.join(t.text or '' for t in text_el).strip()
+        has_br = prev_el.xpath('.//w:br[@w:type="page"]')
+        if not text and not has_br:
+            prev_el.getparent().remove(prev_el)
+            removed += 1
+        else:
+            break
+    return removed
+
+
+def _insert_page_break_before(paragraph):
+    """Вставить разрыв страницы перед указанным параграфом.
+    ★ ФИКС 21: Используем page_break_before=True вместо нового параграфа.
+    Старый метод (новый параграф + w:br) создавал пустые страницы."""
+    # Не вставлять если уже есть разрыв перед заголовком
+    if _has_page_break_before(paragraph):
+        return
+    # Удалить пустые параграфы перед заголовком (они дают пустые страницы)
+    _remove_empty_paragraphs_before(paragraph)
+    
+    # ★ ФИКС 21: page_break_before — не создаёт лишний параграф
+    paragraph.paragraph_format.page_break_before = True
+
+
+def _is_heading_style(style_name):
+    """Определяет, является ли стиль заголовком."""
+    if not style_name:
+        return False
+    return style_name.startswith('Heading') or style_name.startswith('Заголовок')
+
+
+def _heading_level(style_name):
+    """Извлечь уровень заголовка (1, 2, 3) из имени стиля. 0 — не заголовок."""
+    if not _is_heading_style(style_name):
+        return 0
+    m = re.search(r'(\d+)', style_name)
+    return int(m.group(1)) if m else 1
+
+
+def _is_toc_style(style_name):
+    """Определяет, является ли стиль элементом оглавления."""
+    if not style_name:
+        return False
+    return style_name.startswith('TOC') or style_name.startswith('Содержание')
+
+
+def _has_math(paragraph):
+    """Содержит ли параграф OMML-формулу."""
+    return len(paragraph._element.xpath('.//m:oMath')) > 0
+
+
+def _has_image(paragraph):
+    """Содержит ли параграф изображение (drawing/inlineImage)."""
+    return (len(paragraph._element.xpath('.//w:drawing')) > 0 or
+            len(paragraph._element.xpath('.//w:pict')) > 0)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Вставка автооглавления
+# ──────────────────────────────────────────────────────────────────
 
 def _insert_toc_before_intro(doc):
-    """Вставить автооглавление непосредственно перед ВВЕДЕНИЕМ."""
+    """Вставить автооглавление непосредственно перед ВВЕДЕНИЕМ/СОДЕРЖАНИЕМ."""
     if not doc.paragraphs:
         return
 
-    target = doc.paragraphs[0]
+    # Ищем целевой параграф (первый структурный элемент)
+    target = None
     for p in doc.paragraphs:
-        if p.text.strip().upper() == 'ВВЕДЕНИЕ':
+        if p.text.strip().upper() in MAIN_ZONE_TRIGGERS:
             target = p
             break
+    if target is None:
+        # Если не нашли — вставляем в начало
+        target = doc.paragraphs[0]
 
     # Заголовок СОДЕРЖАНИЕ
     ph = target.insert_paragraph_before()
     ph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    ph.paragraph_format.space_before      = Pt(24)
-    ph.paragraph_format.space_after       = Pt(12)
-    ph.paragraph_format.first_line_indent = Cm(0)
+    _clear_indents_and_set(ph, align=WD_ALIGN_PARAGRAPH.CENTER,
+                           space_before=Pt(24), space_after=Pt(12))
     rh = ph.add_run('СОДЕРЖАНИЕ')
     rh.bold      = False
     rh.font.name = cfg.FONT_NAME
@@ -50,7 +245,7 @@ def _insert_toc_before_intro(doc):
     # TOC field
     pt = target.insert_paragraph_before()
     pt.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    pt.paragraph_format.first_line_indent = Cm(0)
+    _clear_indents_and_set(pt, align=WD_ALIGN_PARAGRAPH.LEFT)
     rt = pt.add_run()
     for tag, attr, text in [
         ('w:fldChar', 'begin', None),
@@ -64,226 +259,926 @@ def _insert_toc_before_intro(doc):
         else:
             el.set(qn('w:fldCharType'), attr)
         rt._r.append(el)
+
     # placeholder
     pr = OxmlElement('w:r')
     pt_el = OxmlElement('w:t')
     pt_el.text = '[Оглавление собрано автоматически]'
     pr.append(pt_el)
     rt._r.append(pr)
+
     end = OxmlElement('w:fldChar')
     end.set(qn('w:fldCharType'), 'end')
     rt._r.append(end)
 
-    # Разрыв страницы
-    pb = target.insert_paragraph_before()
-    pb.add_run().add_break()
+    # Разрыв страницы после оглавления
+    _insert_page_break_before(target)
 
 
-# ??????????????????????????????????????????????????????????????????
-#  Главная функция
-# ??????????????????????????????????????????????????????????????????
+# ──────────────────────────────────────────────────────────────────
+#  Форматирование формул
+# ──────────────────────────────────────────────────────────────────
 
-def format_document(input_path, fast=False, legacy=False):
-    print(f"+ Читаем: {input_path}")
+def _format_formula(p):
+    """Выравнивание формулы (центр) и номера (справа) через табуляцию."""
+    # ★ ФИКС 9: Удалить все существующие TAB из runs — иначе формула съезжает
+    for run in p.runs:
+        if '\t' in run.text:
+            # Сохраняем только текст до первой табуляции (формулу),
+            # номер формулы (N.N) после последней табуляции
+            parts = run.text.split('\t')
+            # Фильтруем пустые части
+            non_empty = [x.strip() for x in parts if x.strip()]
+            if non_empty:
+                # Если больше 1 части — первая это формула, последняя может быть номером
+                if len(non_empty) >= 2 and _RE_FORMULA_NUM.search(non_empty[-1]):
+                    # Номер формулы в конце — нужно вынести в отдельный run
+                    run.text = non_empty[0] + '\t'  # формула + табуляция к центру
+                    # Номер формулы будет в tab stop справа
+                    # Добавляем табуляцию и номер как часть текста
+                    run.text = non_empty[0] + '\t\t' + non_empty[-1]
+                else:
+                    run.text = '\t'.join(non_empty)
+            else:
+                run.text = ''
+        # Также очистить XML-табуляции внутри run
+        for t_el in run._r.findall(qn('w:t')):
+            if t_el.text and '\t' in t_el.text:
+                t_el.text = t_el.text.replace('\t', ' ')
+    
+    # ★ ФИКС 18: Формулы по ГОСТ — центрирование параграфа + правая табуляция для номера
+    # Раньше ставили LEFT + табуляции — ненадёжно, формула съезжала
+    _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.CENTER,
+                           first_line_ind=Cm(0),
+                           space_before=Pt(6), space_after=Pt(6))
+    tab_stops = p.paragraph_format.tab_stops
+    tab_stops.clear_all()
+    # Правый край (для A4 с полями 30+15мм) — номер формулы (1), (2.1) и т.д.
+    tab_stops.add_tab_stop(Cm(16.5), WD_TAB_ALIGNMENT.RIGHT)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Форматирование таблиц
+# ──────────────────────────────────────────────────────────────────
+
+def _normalize_tables(doc):
+    """Применяет ГОСТ к таблицам: шрифт, интервал, повтор шапки, границы."""
+    for table in doc.tables:
+        # Повтор шапки на каждой странице
+        if len(table.rows) > 0:
+            tr = table.rows[0]._tr
+            trPr = tr.get_or_add_trPr()
+            if not trPr.xpath('w:tblHeader'):
+                trPr.append(parse_xml(f'<w:tblHeader {nsdecls("w")}/>'))
+
+        # Границы по ГОСТ (тонкие чёрные линии)
+        wu.set_table_border_gost(table)
+
+        # Выравнивание текста и шрифт внутри таблиц
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    if not p.text.strip() and not _has_math(p):
+                        continue
+                    _clear_indents_and_set(p, first_line_ind=Cm(0),
+                                           space_before=Pt(2), space_after=Pt(2),
+                                           line_spacing=1.0)
+                    for run in p.runs:
+                        _set_run_font(run, font_size=cfg.FONT_SIZE_TABLE)
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Классификатор параграфов
+# ──────────────────────────────────────────────────────────────────
+
+class ParagraphType:
+    """Типы параграфов для маршрутизации."""
+    TITLE_ZONE     = 'title_zone'      # Титульный лист / бланк (иммунитет)
+    STRUCTURAL_H1  = 'structural_h1'   # ВВЕДЕНИЕ, ЗАКЛЮЧЕНИЕ и т.п.
+    HEADING        = 'heading'         # Заголовок по стилю Heading/Заголовок
+    TOC_ENTRY      = 'toc_entry'       # Элемент оглавления
+    FORMULA        = 'formula'         # OMML-формула
+    MANUAL_FORMULA = 'manual_formula'  # ★ ФИКС 23: Ручная текстовая формула (не OMML)
+    FIGURE_CAP     = 'figure_caption'  # Подпись к рисунку
+    TABLE_CAP      = 'table_caption'   # Подпись к таблице
+    LIST_ITEM      = 'list_item'       # Элемент списка
+    WHERE_LINE     = 'where_line'      # «где ...» — расшифровка формулы
+    BODY           = 'body'            # Обычный текст
+    EMPTY          = 'empty'           # Пустой параграф
+
+
+def _is_section_heading(text):
+    """Определить, похож ли текст на заголовок раздела: '1. ТЕКСТ' или '1.1 Текст'."""
+    # Берём только ПЕРВУЮ строку параграфа — остальное может быть обычным текстом
+    first_line = text.split('\n')[0].strip()
+    if not first_line:
+        return False, 0
+    
+    # ★ ФИКС 8: Паттерн "1.ТЕКСТ" без пробела — тоже заголовок (часто в БР)
+    # В оригинале "1.ХАРАКТЕРИСТИКА..." — без пробела после точки
+    m = re.match(r'^(\d+(?:\.\d+)*)\s*[.\s]\s*(.+)', first_line)
+    if not m:
+        # Пробуем без пробела: "1.ТЕКСТ" → num="1", rest="ТЕКСТ"
+        m2 = re.match(r'^(\d+)\.([А-ЯЁ]{2,}.*)', first_line)
+        if m2:
+            m = m2
+        else:
+            return False, 0
+    num_part = m.group(1)  # e.g. "1", "1.1", "1.2.17"
+    rest = m.group(2).strip()
+    
+    # ★ Отсеиваем ложные срабатывания:
+    # - Номер с 3+ уровнями (1.2.17) — это пункт списка, не заголовок
+    if num_part.count('.') >= 2:
+        return False, 0
+    # - Текст содержит матем. символы/formula: Iном, S=, P=, ≥, ≤
+    if re.search(r'[=≥≤<>]', rest):
+        return False, 0
+    if re.match(r'^[A-Za-zА-Яа-я]{1,4}[ _]', rest) and re.search(r'\d', rest[:10]):
+        # Скорее всего "Iном аппарата" — технический текст, не заголовок
+        return False, 0
+    # - Короткий текст (<10 символов) после номера — скорее пункт списка
+    if len(rest) < 10:
+        return False, 0
+    
+    # Если текст ЗАГЛАВНЫМИ — точно заголовок раздела
+    upper_ratio = sum(1 for c in rest if c.isupper()) / max(len(rest), 1)
+    if upper_ratio > 0.4:
+        return True, 1 if '.' not in num_part else 2
+    
+    # ★ ФИКС 17: Если номер с точкой (1.1, 2.3) — это подраздел, порог ниже (>8 символов)
+    # ГОСТ-заголовки подразделов бывают короткими: "5.1. Выбор схем" (11 символов)
+    has_sub_num = '.' in num_part
+    min_len = 8 if has_sub_num else 20
+    if len(rest) > min_len and rest[0].isupper():
+        return True, 1 if not has_sub_num else 2
+    
+    return False, 0
+
+
+def _is_manual_formula(text, style_name):
+    """★ ФИКС 23: Определить, является ли строка ручной (текстовой) формулой.
+    
+    Признаки:
+    1. Стиль "Формула*" — 100% формула
+    2. Короткая строка (<100 символов) с = ≥ ≤ где = идёт после переменной
+       без разделителя (X=, I=, P=, S=, U=, R= и т.п.)
+    3. Строка вида "=0,95∙80=76 кВт" — продолжение формулы
+    4. Строка вида "10 ≥ 6 — выполняется" — проверка условия
+    
+    НЕ формула:
+    - "Номинальное напряжение: Uном = 6 кВ" — текстовое описание с параметром
+    - "Коэффициент равен 5" — глагол + текст
+    - "при t = 0,525 с" — контекстное использование
+    """
+    if not text:
+        return False
+    
+    # 1. Стиль "Формула*" — однозначно формула
+    if style_name and style_name.lower().startswith('формула'):
+        return True
+    
+    # 2. Строка начинается с "=" — продолжение формулы
+    if text.startswith('=') and len(text) < 100:
+        return True
+    
+    # 3. Короткая строка с ≥ ≤ и проверкой "выполняется"/"невыполняется"
+    if re.search(r'[≥≤]', text) and len(text) < 100:
+        return True
+    
+    # 4. Паттерн "X= значение" или "X = значение" где X — 1-3 буквы (переменная)
+    # И строка короткая и не содержит ":" перед "=" (это описание параметра)
+    # И нет глаголов/длинного текста перед "="
+    if len(text) < 100 and re.search(r'[=]', text):
+        # Если перед "=" есть двоеточие — это описание: "Напряжение: U = 6" — НЕ формула
+        before_eq = text.split('=')[0]
+        if ':' in before_eq and len(before_eq) > 10:
+            return False
+        # Если перед "=" есть русское слово длиннее 3 символов — скорее описание
+        # Но "Рс=" или "Qмр.=" — это переменная, а не слово
+        # Проверяем: есть ли русский текст из >3 букв перед "="?
+        words_before = re.findall(r'[а-яёА-ЯЁ]{4,}', before_eq)
+        if words_before:
+            # Исключение: сокращения типа "кВар", "кВт" — это единицы, не текст
+            unit_words = {'квар', 'квт', 'мвт', 'мвар'}
+            non_unit = [w for w in words_before if w.lower() not in unit_words]
+            if non_unit:
+                return False
+        # Если после "=" есть числа или переменные — похоже на формулу
+        after_eq = text.split('=', 1)[1] if '=' in text else ''
+        if after_eq.strip() and re.search(r'[\d∙×*/]', after_eq):
+            return True
+    
+    return False
+
+
+def _classify(p, is_main_zone, is_biblio_zone=False, doc=None):
+    """Классифицировать параграф по его роли в документе."""
+    text = p.text.strip()
+    style_name = p.style.name if p.style else 'Normal'
+
+    # Пустой
+    if not text and not _has_math(p) and not _has_image(p):
+        return ParagraphType.EMPTY
+
+    # ★ Подписи к таблицам/рисункам — однозначны по тексту, проверяем ДО зоны титульника
+    # Иначе "Таблица 2.4" в стиле Title в середине документа будет пропущена
+    if _RE_TABLE_CAP.match(text):
+        return ParagraphType.TABLE_CAP
+    if _RE_FIGURE.match(text):
+        return ParagraphType.FIGURE_CAP
+
+    # ★ ФИКС 7: Структурные заголовки (ВВЕДЕНИЕ, ЗАКЛЮЧЕНИЕ) даже в стиле Title
+    # В оригинальном БР.docx ВВЕДЕНИЕ имеет стиль Title, но должно быть STRUCTURAL_H1
+    upper = text.upper().rstrip('.')  # ★ БАГ 14: "ПРИЛОЖЕНИЯ." → "ПРИЛОЖЕНИЯ"
+    if upper in STRUCTURAL_KEYWORDS and is_main_zone:
+        return ParagraphType.STRUCTURAL_H1
+
+    # Зона титульника — иммунитет
+    if not is_main_zone:
+        return ParagraphType.TITLE_ZONE
+
+    # Элемент оглавления
+    if _is_toc_style(style_name):
+        return ParagraphType.TOC_ENTRY
+
+    # Заголовок по СТИЛЮ (не по тексту!)
+    if _is_heading_style(style_name):
+        level = _heading_level(style_name)
+        # Структурные элементы — особый случай H1
+        if level == 1 and upper in STRUCTURAL_KEYWORDS:
+            return ParagraphType.STRUCTURAL_H1
+        return ParagraphType.HEADING
+
+    # ★ Заголовок по ТЕКСТУ (стиль Normal, но выглядит как заголовок раздела)
+    # Это ПЕРЕД проверкой на список — иначе "1. ХАРАКТЕРИСТИКА..." станет списком
+    is_sh, sh_level = _is_section_heading(text)
+    if is_sh and is_main_zone:
+        # Присваиваем стиль Heading — чтобы Word видел это как заголовок
+        if doc is not None:
+            try:
+                target_style = f'Heading {sh_level}'
+                p.style = doc.styles[target_style]
+            except Exception:
+                pass
+        if sh_level == 1 and upper in STRUCTURAL_KEYWORDS:
+            return ParagraphType.STRUCTURAL_H1
+        return ParagraphType.HEADING
+
+    # Формула (OMML или номер формулы в конце)
+    if _has_math(p) or _RE_FORMULA_NUM.search(text):
+        return ParagraphType.FORMULA
+
+    # ★ ФИКС 23: Ручная текстовая формула (не OMML, но по сути формула)
+    # Признаки: стиль "Формула*", или короткая строка с = ≥ ≤ > < без глаголов
+    # Строка вида "Рс= Pр(л)+Pст.у=18,2+4=22,2 кВт" — это формула, не текст
+    # Но "Номинальное напряжение сети: Uном = 6 кВ" — это текст с параметром
+    if _is_manual_formula(text, style_name):
+        return ParagraphType.MANUAL_FORMULA
+
+    # (TABLE_CAP и FIGURE_CAP уже проверены выше, ДО зоны титульника)
+
+    # ★ ФИКС 15: List Paragraph с ЗАГЛАВНЫМ текстом — это ЗАГОЛОВОК, а не список!
+    # В БР.docx "ХАРАКТЕРИСТИКА И АНАЛИЗ ОБЪЕКТА ЭЛЕКТРОСНАБЖЕНИЯ." 
+    # в стиле List Paragraph с numPr → Word подставляет "1." через нумерацию
+    # Форматер видел numPr и делал LIST_ITEM ("— Текст"), а надо HEADING
+    num_prs = p._element.xpath('.//w:numPr')
+    if is_main_zone and num_prs and len(text) > 10:
+        upper_ratio = sum(1 for c in text if c.isupper()) / max(len(text), 1)
+        if upper_ratio > 0.4:
+            # Убрать numPr — нумерацию заменит текст заголовка
+            pPr = p._element.get_or_add_pPr()
+            for np in num_prs:
+                pPr.remove(np)
+            # Присвоить стиль Heading 1
+            if doc is not None:
+                try:
+                    p.style = doc.styles['Heading 1']
+                except Exception:
+                    pass
+            # Добавить номер раздела в начало текста (numPr давал номер, теперь вручную)
+            _lp_heading_counter[0] += 1
+            sn = _lp_heading_counter[0]
+            for run in p.runs:
+                if run.text and run.text.strip():
+                    run.text = f"{sn}. {run.text.lstrip()}"
+                    break
+            return ParagraphType.HEADING
+
+    # Элемент списка
+    # ★ В зоне библиографии — НЕ считать нумерованные элементы списком
+    num_prs = p._element.xpath('.//w:numPr')
+    if is_biblio_zone and num_prs:
+        return ParagraphType.BODY  # библиография — нумерованный список, НЕ маркер
+    if num_prs or _RE_LIST_PREFIX.match(text) or _RE_NUM_LIST.match(text):
+        return ParagraphType.LIST_ITEM
+
+    # Расшифровка формулы («где»)
+    if _RE_WHERE_LINE.match(text):
+        return ParagraphType.WHERE_LINE
+
+    # Обычный текст
+    return ParagraphType.BODY
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Обработчики по типам
+# ──────────────────────────────────────────────────────────────────
+
+def _handle_title_zone(p):
+    """Титульная зона: ПОЛНЫЙ ИММУНИТЕТ — не трогаем вообще ничего.
+    ★ ФИКС G: Титульник + задание выдаются кафедрой — нельзя менять.
+    Раньше ставили TNR и меняли размеры — это ломало форматирование.
+    Теперь: НИКАКИХ изменений. Только шрифт TNR на runs (ГОСТ требует)."""
+    # ★ ФИКС G: Вообще не трогаем отступы, интервалы, размеры
+    # Только меняем шрифт на TNR — это минимальное ГОСТ-требование
+    for run in p.runs:
+        if run.font.name and run.font.name.lower() in ('consolas', 'courier new'):
+            continue
+        run.font.name = cfg.FONT_NAME
+        # НЕ меняем размер, bold, italic — всё от стиля
+
+
+def _handle_structural_h1(p):
+    """Структурный заголовок (ВВЕДЕНИЕ, ЗАКЛЮЧЕНИЕ...): центр, без отступа, нежирный."""
+    # ★ ФИКС 25: page_break_before для структурных заголовков (ЗАКЛЮЧЕНИЕ и т.п.)
+    # Раньше разрыв страницы ставился только для Heading 1, но не для STRUCTURAL_H1
+    _insert_page_break_before(p)
+    
+    _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.CENTER,
+                           first_line_ind=Cm(0),
+                           space_before=Pt(24), space_after=Pt(12),
+                           keep_next=True)
+    # Убедимся что стиль — Heading 1
+    try:
+        p.style = p.part.document.styles['Heading 1']
+    except Exception:
+        pass
+    # ★ БАГ 2/ФИКС 10b: Убрать точку в конце структурного заголовка (ГОСТ запрещает)
+    text = p.text.strip()
+    if text.endswith('.') and len(text) > 5:
+        for run in reversed(p.runs):
+            if run.text and run.text.rstrip().endswith('.') and not run.text.rstrip().endswith('..'):
+                run.text = run.text[:-1] if run.text.endswith('.') else run.text[:run.text.rfind('.')]
+                break
+    # Очистка табуляций из runs — они ломают центрирование
+    for run in p.runs:
+        if '\t' in run.text:
+            run.text = run.text.replace('\t', ' ').strip()
+        # Удаляем также XML-табуляции <w:tab/> и \t в w:t
+        for t_el in run._r.findall(qn('w:t')):
+            if t_el.text and '\t' in t_el.text:
+                t_el.text = t_el.text.replace('\t', ' ').strip()
+        for tab_el in run._r.findall(qn('w:tab')):
+            run._r.remove(tab_el)
+    # Очистка табуляций из XML параграфа (в т.ч. между runs)
+    pPr = p._element.find(qn('w:pPr'))
+    if pPr is not None:
+        for tabs in pPr.findall(qn('w:tabs')):
+            pPr.remove(tabs)
+    for run in p.runs:
+        _set_run_font(run, font_size=cfg.FONT_SIZE_H1, bold=cfg.BOLD_H1)
+
+
+def _handle_heading(p):
+    """Обычный заголовок по стилю. ГОСТ: центр, без отступа, без точки."""
+    level = _heading_level(p.style.name)
+    is_h1 = (level == 1)
+
+    # ★ ФИКС 10: Убрать точку в конце заголовка (ГОСТ запрещает)
+    text = p.text.strip()
+    if text.endswith('.') and len(text) > 5:
+        # Не убираем точку если это номер раздела "1." (короткий текст)
+        # Или если точка — часть сокращения (кВт., кВ. — нет, заголовок не заканчивается так)
+        # Убираем точку из runs
+        for run in reversed(p.runs):
+            if run.text and run.text.rstrip().endswith('.'):
+                # Убираем точку только из последнего run
+                stripped = run.text.rstrip()
+                if stripped.endswith('.') and not stripped.endswith('..'):
+                    run.text = run.text[:-1] if run.text.endswith('.') else run.text[:run.text.rfind('.')]
+                    break
+
+    # Очистка табуляций из runs заголовка — они ломают центрирование
+    for run in p.runs:
+        if '\t' in run.text:
+            run.text = run.text.replace('\t', ' ').strip()
+        for t_el in run._r.findall(qn('w:t')):
+            if t_el.text and '\t' in t_el.text:
+                t_el.text = t_el.text.replace('\t', ' ').strip()
+        # ★ БАГ 5: Удаляем XML-табуляции <w:tab/>
+        for tab_el in run._r.findall(qn('w:tab')):
+            run._r.remove(tab_el)
+
+    # Разрыв страницы перед H1 (кроме первого заголовка в документе)
+    if is_h1:
+        _insert_page_break_before(p)
+
+    # Формат абзаца
+    _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.CENTER,
+                           first_line_ind=Cm(0),
+                           space_before=Pt(24) if is_h1 else Pt(18),
+                           space_after=Pt(12),
+                           keep_next=True)
+
+    # ★ ФИКС C: НЕ ставим font_size на runs если он None (наследуется от стиля Heading)
+    # Стили Heading уже задают правильный размер через word_config/setup_gost_styles
+    bold_map = {1: cfg.BOLD_H1, 2: cfg.BOLD_H2, 3: cfg.BOLD_H3}
+    size_map = {1: cfg.FONT_SIZE_H1, 2: cfg.FONT_SIZE_H2, 3: cfg.FONT_SIZE_H3}
+    bold_val = bold_map.get(level, False)
+    # ★ ФИКС C: Передаём размер в _set_run_font, но он НЕ перезапишет если run.font.size is None
+    # Таким образом стиль Heading контролирует размер, а не форматер
+    size_val = size_map.get(level, cfg.FONT_SIZE_MAIN)
+
+    for run in p.runs:
+        _set_run_font(run, font_size=size_val, bold=bold_val)
+
+
+def _handle_toc_entry(p):
+    """Элемент оглавления: только шрифт, не ломаем структуру TOC."""
+    for run in p.runs:
+        _set_run_font(run, font_size=cfg.FONT_SIZE_MAIN, bold=False)
+
+
+def _handle_formula(p):
+    """Формула: центровка через табуляции."""
+    _format_formula(p)
+    for run in p.runs:
+        if run.font.name and run.font.name.lower() in ('consolas', 'courier new'):
+            continue
+        run.font.name = cfg.FONT_NAME
+        run.font.size = cfg.FONT_SIZE_MAIN
+
+
+def _handle_manual_formula(p):
+    """★ ФИКС 23: Ручная текстовая формула — по центру, без отступа, без табуляций.
+    Отличие от OMML-формул: нет номера формулы, нет табуляций.
+    Просто CENTER + нулевой first_line_indent."""
+    _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.CENTER,
+                           first_line_ind=Cm(0),
+                           space_before=Pt(6), space_after=Pt(6))
+    for run in p.runs:
+        if run.font.name and run.font.name.lower() in ('consolas', 'courier new'):
+            continue
+        run.font.name = cfg.FONT_NAME
+        run.font.size = cfg.FONT_SIZE_MAIN
+
+
+def _handle_figure_caption(p, legacy=False):
+    """Подпись к рисунку: по центру, без отступа."""
+    _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.CENTER,
+                           first_line_ind=Cm(0),
+                           space_before=Pt(6), space_after=Pt(12))
+
+    text = p.text.strip()
+    match = _RE_FIGURE.match(text)
+    if match:
+        num     = match.group(2)
+        caption = match.group(3).strip()
+        label   = "Рис. " if legacy else "Рисунок "
+        sep     = ". " if legacy else " — "
+
+        # Пересобираем текст, сохраняя runs для формул/спецсимволов
+        new_text = f"{label}{num}{sep}{caption}"
+        if legacy and not new_text.endswith('.'):
+            new_text += "."
+
+        # Не используем p.text = ... — это убьёт форматирование
+        # Вместо этого модифицируем первый run и удаляем лишние
+        if p.runs:
+            p.runs[0].text = new_text
+            for run in p.runs[1:]:
+                # Проверяем, не содержит ли run формулу или спецобъект
+                if _has_math_in_run(run):
+                    continue
+                run.text = ""
+        else:
+            p.add_run(new_text)
+
+    for run in p.runs:
+        _set_run_font(run, font_size=cfg.FONT_SIZE_MAIN, bold=False)
+
+
+def _handle_table_caption(p, doc=None, legacy=False):
+    """Подпись к таблице: слева без отступа, над таблицей."""
+    _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.LEFT,
+                           first_line_ind=Cm(0),
+                           space_before=Pt(12), space_after=Pt(6),
+                           keep_next=True)
+
+    text = p.text.strip()
+    match = _RE_TABLE_CAP.match(text)
+    if match:
+        num     = match.group(2)
+        caption = match.group(3).strip()
+
+        # ★ Если caption пустой — возможно название на следующей строке этого же параграфа
+        if not caption:
+            # Текст после "Таблица N.N —" или "Таблица N.N" до конца
+            remainder = text[match.end():].strip()
+            if remainder and len(remainder) < 200 and remainder.upper() not in STRUCTURAL_KEYWORDS:
+                caption = remainder
+
+        # ★ Если всё ещё пустой — ищем название в следующем параграфе
+        if not caption and doc is not None:
+            next_p = _find_next_paragraph(p, doc)
+            if next_p and next_p.text.strip():
+                next_text = next_p.text.strip()
+                # Не берём если это другой структурный элемент / заголовок
+                if not _is_heading_style(next_p.style.name if next_p.style else '') and \
+                   next_text.upper() not in STRUCTURAL_KEYWORDS and \
+                   len(next_text) < 200:
+                    caption = next_text
+                    # ★ БАГ 15: Удалить параграф с названием полностью (не просто очистить)
+                    next_p._element.getparent().remove(next_p._element)
+
+        # Названия таблиц должны быть в исходном документе (БР.docx)
+        # Если caption пустой — оставляем как есть
+
+        if legacy:
+            new_text = f"Таблица {num}."
+            if caption:
+                new_text = f"{caption}\nТаблица {num}."
+        else:
+            # ★ Отсеиваем мусорные названия (|, числа, короткий мусор)
+            if caption and len(caption) < 3:
+                caption = ""
+            # ★ Если caption содержит "Пример расчета" или "Примечани" — это не название таблицы
+            if caption and re.match(r'^(Пример|Приме[ч]|Примечание|П\s*р\s*и\s*м\s*е\s*ч)', caption, re.I):
+                caption = ""
+            if caption:
+                new_text = f"Таблица {num} — {caption}"
+            else:
+                new_text = f"Таблица {num}"
+
+        if p.runs:
+            p.runs[0].text = new_text
+            for run in p.runs[1:]:
+                if _has_math_in_run(run):
+                    continue
+                run.text = ""
+        else:
+            p.add_run(new_text)
+
+    for run in p.runs:
+        _set_run_font(run, font_size=cfg.FONT_SIZE_MAIN, bold=False)
+
+
+def _find_next_paragraph(p, doc):
+    """Найти следующий НЕПУСТОЙ параграф в документе после данного."""
+    found = False
+    for dp in doc.paragraphs:
+        if found:
+            if dp.text.strip():
+                return dp
+            # пустые — пропускаем
+            continue
+        if dp._element is p._element:
+            found = True
+    return None
+
+
+def _has_math_in_run(run):
+    """Проверяет, содержит ли run математические элементы."""
+    return len(run._r.xpath('.//m:oMath')) > 0
+
+
+def _handle_list_item(p):
+    """Элемент списка: тире + текст, с абзацным отступом."""
+    # Удаляем системный маркер Word (numPr), если есть
+    num_prs = p._element.xpath('.//w:numPr')
+    if num_prs:
+        pPr = p._element.get_or_add_pPr()
+        pPr.remove(num_prs[0])
+
+    text = p.text.strip()
+    # Заменяем маркер на ГОСТ-тире, но НЕ через p.text
+    clean = re.sub(r'^[-—–•\s]+', '', text)
+    # Убираем нумерованный префикс (а), 1)) и ставим тире
+    clean = _RE_NUM_LIST.sub('', clean) if _RE_NUM_LIST.match(clean) else clean
+
+    if p.runs:
+        # Переносим весь текст в первый run, остальные очищаем
+        # (кроме тех, что содержат формулы)
+        first = True
+        for run in p.runs:
+            if _has_math_in_run(run):
+                continue
+            if first:
+                run.text = f"— {clean}"
+                first = False
+            else:
+                run.text = ""
+    else:
+        p.add_run(f"— {clean}")
+
+    _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY,
+                           first_line_ind=cfg.FIRST_LINE_INDENT,
+                           line_spacing=cfg.LINE_SPACING)
+    for run in p.runs:
+        _set_run_font(run, font_size=cfg.FONT_SIZE_MAIN)
+
+
+def _handle_where_line(p):
+    """Строка «где ...» — расшифровка формулы. Без абзацного отступа.
+    ★ ФИКС 20: Удалить пустые параграфы перед 'где' — по ГОСТ расшифровка идёт сразу после формулы."""
+    # Удаляем пустые параграфы перед "где" (между формулой и расшифровкой)
+    prev_elem = p._element.getprevious()
+    while prev_elem is not None:
+        # Проверяем что это параграф и он пустой
+        tag = prev_elem.tag.split('}')[-1] if '}' in prev_elem.tag else prev_elem.tag
+        if tag != 'p':
+            break
+        # Есть ли текст или OMML в этом параграфе?
+        ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        ns_m = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+        texts = prev_elem.findall(f'.//{{{ns_w}}}t')
+        omath = prev_elem.findall(f'.//{{{ns_m}}}oMath')
+        has_text = any(t.text and t.text.strip() for t in texts)
+        if has_text or omath:
+            break  # Не пустой — остановились
+        # Пустой — удаляем
+        parent = prev_elem.getparent()
+        prev_prev = prev_elem.getprevious()
+        parent.remove(prev_elem)
+        prev_elem = prev_prev
+
+    _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY,
+                           first_line_ind=Cm(0),
+                           line_spacing=cfg.LINE_SPACING)
+    for run in p.runs:
+        _set_run_font(run, font_size=cfg.FONT_SIZE_MAIN)
+
+
+def _handle_body(p):
+    """Обычный текст: по ширине, с абзацным отступом."""
+    _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY,
+                           first_line_ind=cfg.FIRST_LINE_INDENT,
+                           line_spacing=cfg.LINE_SPACING)
+    for run in p.runs:
+        _set_run_font(run, font_size=cfg.FONT_SIZE_MAIN)
+
+
+def _handle_empty(p):
+    """Пустой параграф: минимальные интервалы, чтобы не было дыр.
+    ★ ФИКС B: НЕ ставим line_spacing на пустые абзацы — они раздули документ с 66 до 86 страниц."""
+    # ★ БАГ 21: Пустой параграф с page break создаёт пустую страницу — удалить break
+    for br in p._element.xpath('.//w:br[@w:type="page"]'):
+        br.getparent().remove(br)
+    pf = p.paragraph_format
+    pf.space_before = Pt(0)
+    pf.space_after  = Pt(0)
+    # ★ ФИКС B: Пустой абзац не должен иметь 1.5 интервал — даёт лишние страницы
+    # Ставим 1.0 (одинарный) чтобы визуально не раздувать
+    pf.line_spacing = 1.0
+
+
+# ──────────────────────────────────────────────────────────────────
+#  Основная логика
+# ──────────────────────────────────────────────────────────────────
+
+def process_document(input_path, output_path=None, fast=False, legacy=False):
+    print(f"[~] Читаем: {input_path}")
     doc = Document(input_path)
 
-    # ?? Стили ?????????????????????????????????????????????????????
-    # Настраиваем Normal (только шрифт, без size -- чтобы не раздуть таблицы)
-    doc.styles['Normal'].font.name = cfg.FONT_NAME
+    # 0. Настройка базовых стилей документа
+    wu.setup_gost_styles(doc)
 
-    wu.setup_gost_styles(doc)       # Heading 1-3 + TOC 1-3
+    # 1. Параметры страницы
+    # ★ ФИКС 22: Устанавливаем размер страницы А4 (210×297 мм = 11906×16838 twips)
+    # Без этого секция могла быть Letter/Legal/произвольного размера из исходника
+    A4_WIDTH  = Mm(210)   # 11906 twips
+    A4_HEIGHT = Mm(297)   # 16838 twips
+    for section in doc.sections:
+        section.page_width   = A4_WIDTH
+        section.page_height  = A4_HEIGHT
+        section.orientation  = 0  # WD_ORIENT.PORTRAIT
+        section.top_margin    = cfg.MARGIN_TOP
+        section.bottom_margin = cfg.MARGIN_BOTTOM
+        section.left_margin   = cfg.MARGIN_LEFT
+        section.right_margin  = cfg.MARGIN_RIGHT
 
-    # ?? Анализ абзацев ????????????????????????????????????????????
-    print("[*] Анализ абзацев...")
-    formatting_on = False
+    # 2. Определяем начало основной зоны
+    is_main_zone = False
+
+    # Первый проход: находим где начинается основная зона
+    for p in doc.paragraphs:
+        upper = p.text.strip().upper()
+        if upper in MAIN_ZONE_TRIGGERS or _is_toc_style(p.style.name if p.style else ''):
+            is_main_zone = True
+            break
+
+    # Если нет титульника — вся документ основная зона
+    if not is_main_zone:
+        is_main_zone = True
+
+    # 3. Обработка параграфов
+    print("[*] Анализ и нормализация текста...")
+
+    # ★ ФИКС 11: ОТКЛЮЧЕН — удалял формулы (OMML-параграфы)
+    # p.text пуст для OMML, но формулы отображаются в Word.
+    # Удаление 104 "пустых" параграфов уничтожило 56% контента!
+    # Формулы (m:oMath) — НЕ пустые, они рендерятся в Word/LibreOffice.
+    removed_omml = 0
+    # for p in list(doc.paragraphs):
+    #     has_math = _has_math(p)
+    #     text = p.text.strip()
+    #     if has_math and not text:
+    #         if not _has_image(p):
+    #             p._element.getparent().remove(p._element)
+    #             removed_omml += 1
+    # if removed_omml:
+    #     print(f"[ФИКС 11] Удалено {removed_omml} пустых OMML-параграфов")
+
+    # ★ ФИКС I: Удалить подряд идущие пустые абзацы (оставлять максимум 1)
+    # В оригинале часто 3-5 пустых строк подряд — они раздували документ
+    removed_consecutive = 0
+    all_paras = list(doc.paragraphs)
+    consecutive_empty = 0
+    for p in all_paras:
+        is_empty = (not p.text.strip() and not _has_math(p) and not _has_image(p) and
+                    not p._element.xpath('.//w:br[@w:type="page"]'))
+        if is_empty:
+            consecutive_empty += 1
+            if consecutive_empty > 1:
+                p._element.getparent().remove(p._element)
+                removed_consecutive += 1
+        else:
+            consecutive_empty = 0
+    if removed_consecutive:
+        print(f"[ФИКС I] Удалено {removed_consecutive} лишних пустых абзацев (из серий >1)")
+
+    # ★ ФИКС 14: Удалить пустые страницы в хвосте документа (после ПРИЛОЖЕНИЯ)
+    # Ищем "ПРИЛОЖЕНИЯ" и удаляем всё после него, кроме параграфов с контентом
+    # ★ БАГ 6: Удаляем также параграфы с ТОЛЬКО page break — они создают пустые страницы
+    # ★ БАГ 10: Собираем параграфы к удалению, не удаляем на лету (IndexError)
+    found_appendix = False
+    last_content_idx = -1
+    all_paras = list(doc.paragraphs)
+    for i, p in enumerate(all_paras):
+        text = p.text.strip().upper()
+        if 'ПРИЛОЖЕН' in text:
+            found_appendix = True
+        if p.text.strip() or _has_math(p) or _has_image(p):
+            last_content_idx = i
+    
+    # Удаляем пустые параграфы + параграфы с ТОЛЬКО page break после последнего контента
+    if found_appendix and last_content_idx >= 0:
+        removed_tail = 0
+        to_remove = []
+        for i in range(len(all_paras) - 1, last_content_idx, -1):
+            p = all_paras[i]
+            is_empty = not p.text.strip() and not _has_math(p) and not _has_image(p)
+            # Параграф только с page break — тоже мусор
+            has_only_break = (not p.text.strip() and
+                             len(p._element.xpath('.//w:br[@w:type="page"]')) > 0 and
+                             not _has_math(p) and not _has_image(p))
+            if is_empty or has_only_break:
+                to_remove.append(p._element)
+        for el in to_remove:
+            el.getparent().remove(el)
+            removed_tail += 1
+        if removed_tail:
+            print(f"[ФИКС 14] Удалено {removed_tail} пустых параграфов в хвосте")
+
+    # ★ ФИКС 16: Объединение разделённых заголовков (2 абзаца вместо 1)
+    # "4.5. Проверка выбранных сечений по допустимым" + "потерям напряжения"
+    merged_headings = 0
+    paras = list(doc.paragraphs)
+    for i in range(len(paras) - 1):
+        p_cur = paras[i]
+        p_next = paras[i + 1]
+        sn1 = p_cur.style.name if p_cur.style else ''
+        sn2 = p_next.style.name if p_next.style else ''
+        # Оба — заголовки одного уровня?
+        if _is_heading_style(sn1) and _is_heading_style(sn2) and _heading_level(sn1) == _heading_level(sn2):
+            text_cur = p_cur.text.strip()
+            text_next = p_next.text.strip()
+            # Текущий не заканчивается знаком препинания → продолжение
+            if text_cur and text_next and len(text_cur) > 5 and not text_cur[-1] in '.!?;:':
+                # Перенести текст next в последний run current
+                last_run = p_cur.runs[-1] if p_cur.runs else None
+                if last_run:
+                    last_run.text = last_run.text.rstrip() + ' ' + text_next
+                    # Удалить next paragraph
+                    p_next._element.getparent().remove(p_next._element)
+                    merged_headings += 1
+    if merged_headings:
+        print(f"[ФИКС 16] Объединено {merged_headings} разделённых заголовков")
+
+    # Нужно пересчитывать is_main_zone по ходу, т.к. титульник может быть
+    is_main_zone = False
+    seen_main_trigger = False
+    is_biblio_zone = False  # ★ Зона библиографии — не срезать numPr
+    _lp_heading_counter[0] = 0  # ★ Сброс счётчика ФИКС 15
 
     for p in doc.paragraphs:
-        text = p.text.strip()
-        if not text:
-            continue
+        # ★ ФИКС 13: Стили HTML Preformatted / Normal (Web) → нормальный Body
+        style_name = p.style.name if p.style else 'Normal'
+        if style_name in ('HTML Preformatted', 'Normal (Web)', 'No Spacing'):
+            try:
+                p.style = doc.styles['Normal']
+            except Exception:
+                pass
 
-        upper = text.upper()
+        # Обновляем флаг основной зоны
+        upper = p.text.strip().upper().rstrip('.')
+        if upper in MAIN_ZONE_TRIGGERS or _is_toc_style(p.style.name if p.style else ''):
+            if not seen_main_trigger:
+                seen_main_trigger = True
+                is_main_zone = True
 
-        # Ожидание начала основного текста
-        if not formatting_on:
-            if re.match(r'^\s*(ВВЕДЕНИЕ|ОГЛАВЛЕНИЕ|СОДЕРЖАНИЕ|РЕФЕРАТ)\s*$', upper):
-                formatting_on = True
-        if not formatting_on:
-            continue
+        # ★ Отслеживаем зону библиографии
+        if upper in _BIBLIO_KEYWORDS:
+            is_biblio_zone = True
 
-        # Пропускаем TOC-записи
-        if p.style.name.startswith('TOC'):
-            continue
+        ptype = _classify(p, is_main_zone, is_biblio_zone=is_biblio_zone, doc=doc)
 
-        # ?? Определяем заголовок ??????????????????????????????????
-        is_heading = False
-        level = 1
-        too_long = len(text) > 120
-        is_toc_title = upper in ('СОДЕРЖАНИЕ', 'ОГЛАВЛЕНИЕ')
-
-        if is_toc_title:
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p.paragraph_format.first_line_indent = Cm(0)
-            p.paragraph_format.space_before      = Pt(24)
-            p.paragraph_format.space_after       = Pt(12)
-            p.paragraph_format.line_spacing      = cfg.LINE_SPACING
-            p.paragraph_format.keep_with_next    = True
-            for run in p.runs:
-                run.bold      = False
-                run.font.size = cfg.FONT_SIZE_TOC_TITLE
-                run.font.name = cfg.FONT_NAME
-                run.font.color.rgb = cfg.COLOR_BLACK
-            continue
-
-        if not too_long:
-            if upper.strip() in cfg.STRICT_H1 or upper.strip().startswith('ПРИЛОЖЕНИЕ'):
-                is_heading = True
-                level = 1
-            elif p.style.name.startswith('Heading') or p.style.name.startswith('Заголовок'):
-                is_heading = True
-                try:
-                    level = int(p.style.name.split()[-1])
-                except (ValueError, IndexError):
-                    level = 1
+        # Маршрутизация
+        if ptype == ParagraphType.TITLE_ZONE:
+            _handle_title_zone(p)
+        elif ptype == ParagraphType.STRUCTURAL_H1:
+            _handle_structural_h1(p)
+        elif ptype == ParagraphType.HEADING:
+            _handle_heading(p)
+        elif ptype == ParagraphType.TOC_ENTRY:
+            _handle_toc_entry(p)
+        elif ptype == ParagraphType.FORMULA:
+            _handle_formula(p)
+        elif ptype == ParagraphType.MANUAL_FORMULA:
+            # ★ ФИКС 23: Ручные текстовые формулы — по центру
+            _handle_manual_formula(p)
+        elif ptype == ParagraphType.FIGURE_CAP:
+            _handle_figure_caption(p, legacy=legacy)
+        elif ptype == ParagraphType.TABLE_CAP:
+            _handle_table_caption(p, doc=doc, legacy=legacy)
+        elif ptype == ParagraphType.LIST_ITEM:
+            _handle_list_item(p)
+        elif ptype == ParagraphType.WHERE_LINE:
+            _handle_where_line(p)
+        elif ptype == ParagraphType.BODY:
+            if is_biblio_zone:
+                # ★ ФИКС 24: В зоне библиографии — ТОЛЬКО шрифт TNR
+                # НЕ трогаем отступы, выравнивание, интервалы — они свои
+                for run in p.runs:
+                    _set_run_font(run, font_size=cfg.FONT_SIZE_MAIN)
             else:
-                pPr = p._element.pPr
-                if pPr is not None:
-                    ol = pPr.find(qn('w:outlineLvl'))
-                    if ol is not None:
-                        val = int(ol.get(qn('w:val')))
-                        if val < 9:
-                            is_heading = True
-                            level = val + 1
+                _handle_body(p)
+        elif ptype == ParagraphType.EMPTY:
+            _handle_empty(p)
 
-        # ?? Применяем стиль заголовка ?????????????????????????????
-        if is_heading:
-            is_strict = (upper.strip() in cfg.STRICT_H1
-                         or upper.strip().startswith('ПРИЛОЖЕНИЕ'))
+    # 4. Нормализация таблиц
+    print("[*] Нормализация таблиц...")
+    _normalize_tables(doc)
 
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER if is_strict else WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.first_line_indent = Cm(0) if is_strict else cfg.FIRST_LINE_INDENT
-            p.paragraph_format.line_spacing      = cfg.LINE_SPACING
-            p.paragraph_format.keep_with_next    = True
+    # 5. Нумерация страниц (внизу по центру, пропуская первую)
+    wu.add_page_numbering(doc, smart_skip=True, align=WD_ALIGN_PARAGRAPH.CENTER)
 
-            # Outline Level
-            pPr = p._element.get_or_add_pPr()
-            ol  = pPr.find(qn('w:outlineLvl'))
-            if ol is None:
-                ol = OxmlElement('w:outlineLvl')
-                pPr.append(ol)
-            ol.set(qn('w:val'), str(level - 1))
-
-            p.paragraph_format.space_before = Pt(24) if level == 1 else Pt(18)
-            p.paragraph_format.space_after  = Pt(12)
-
-            bold_map = {1: cfg.BOLD_H1, 2: cfg.BOLD_H2, 3: cfg.BOLD_H3}
-            size_map = {1: cfg.FONT_SIZE_H1, 2: cfg.FONT_SIZE_H2, 3: cfg.FONT_SIZE_H3}
-
-            for run in p.runs:
-                run.font.name = cfg.FONT_NAME
-                run.font.size = size_map.get(level, cfg.FONT_SIZE_MAIN)
-                run.bold      = bold_map.get(level, False)
-            continue
-
-        # ?? Обычный текст ?????????????????????????????????????????
-
-        # Защита: центр/правое/индент- авторской верстки
-        if p.alignment in (WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.RIGHT):
-            continue
-        if p.paragraph_format.left_indent and p.paragraph_format.left_indent.cm > 0.5:
-            continue
-        # Защита: жёсткие табуляции (формулы)
-        if '\t' in p.text:
-            continue
-
-        # Подписи к рисункам/таблицам
-        cap_regex = r'^(Рисунок|Рис\.|Таблица|Продолжение\s*таблицы)\s*\d+' if legacy else r'^(Рисунок|Таблица|Продолжение\s*таблицы)\s*\d+'
-        
-        if re.match(cap_regex, text, re.I):
-            p.paragraph_format.first_line_indent = Cm(0)
-            if text.lower().startswith('рисунок') or text.lower().startswith('рис.'):
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            else:
-                # Таблицы: Modern - Left, Legacy - Right
-                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT if legacy else WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.space_before = Pt(0)
-            p.paragraph_format.space_after  = Pt(0)
-        else:
-            is_list = p.style.name.startswith('List') or 'numPr' in p._element.xml
-            if not is_list:
-                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                p.paragraph_format.first_line_indent = cfg.FIRST_LINE_INDENT
-            p.paragraph_format.line_spacing  = cfg.LINE_SPACING
-            p.paragraph_format.space_before  = Pt(0)
-            p.paragraph_format.space_after   = Pt(0)
-            p.paragraph_format.widow_control = True
-
-        for run in p.runs:
-            if run.font.name and run.font.name.lower() in ('consolas', 'courier new'):
-                continue
-            run.font.name = cfg.FONT_NAME
-            if run.font.size is None:
-                run.font.size = cfg.FONT_SIZE_MAIN
-            elif run.font.size != cfg.FONT_SIZE_MAIN and not (run.font.subscript or run.font.superscript):
-                run.font.size = cfg.FONT_SIZE_MAIN
-
-    # ?? Нумерация страниц ?????????????????????????????????????????
-    wu.add_page_numbering(doc, smart_skip=True)
-
-    # ?? TOC ???????????????????????????????????????????????????????
+    # 6. Вставка TOC (если нет)
     doc_xml = doc._element.xml.upper()
-    has_toc = bool(re.search(r'INSTRTEXT[^>]*>.*?TOC\s+', doc_xml)) \
-              or ('СОДЕРЖАНИЕ' in doc_xml and 'SDT' in doc_xml)
-    if not has_toc:
-        for p in doc.paragraphs[:100]:
-            if 'СОДЕРЖАНИЕ' in p.text.upper() or 'ОГЛАВЛЕНИЕ' in p.text.upper():
-                has_toc = True
-                break
+    has_toc = ('TOC' in doc_xml or
+               any(p.text.strip().upper() in ('СОДЕРЖАНИЕ', 'ОГЛАВЛЕНИЕ')
+                   for p in doc.paragraphs))
     if not has_toc:
         print("[+] Вставляем автооглавление...")
         _insert_toc_before_intro(doc)
 
-    # ?? Сохранение ????????????????????????????????????????????????
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(input_path)), 'data')
-    if not os.path.exists(out_dir):
-        out_dir = os.path.dirname(os.path.abspath(input_path))
+    # 7. Сохранение
+    if not output_path:
+        base = os.path.splitext(os.path.basename(input_path))[0]
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(input_path)), 'data')
+        if not os.path.exists(out_dir):
+            out_dir = os.path.dirname(os.path.abspath(input_path))
+        output_path = os.path.join(out_dir, f"{base}_GOST.docx")
 
-    base = re.sub(r'_v\d+$', '', re.sub(r'_GOST$', '', os.path.splitext(os.path.basename(input_path))[0]))
-    v = 1
-    while True:
-        output = os.path.join(out_dir, f"{base}_GOST_v{v}.docx")
-        if not os.path.exists(output):
-            break
-        v += 1
+    wu.save_document_safe(doc, output_path)
 
-    wu.save_document_safe(doc, output)
-
-    # ?? COM-обновление ????????????????????????????????????????????
+    # 8. COM-обновление (если не --fast)
     if not fast:
-        wu.update_document_via_com(output)
+        wu.update_document_via_com(output_path)
+
+    print(f"[OK] ГОСТ-форматирование завершено: {output_path}")
 
 
-import argparse
+# ──────────────────────────────────────────────────────────────────
+#  CLI
+# ──────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Форматирование Word документов по ГОСТ")
-    parser.add_argument('-i', '--input', required=True, help="Путь к файлу или папке для обработки")
-    parser.add_argument('-o', '--output', default=None, help="Путь для сохранения результата")
-    parser.add_argument('--fast', action='store_true', help="Быстрая обработка без запуска MS Word (не обновляет поля)")
-    parser.add_argument('--legacy', action='store_true', help="Использовать старый стиль оформления (Рис. вместо Рисунок, точки вместо тире)")
-    
+    import argparse
+    parser = argparse.ArgumentParser(description="ГОСТ-форматер Word-документов v3.2")
+    parser.add_argument('-i', '--input', required=True, help="Входной файл или папка")
+    parser.add_argument('-o', '--output', help="Выходной файл")
+    parser.add_argument('--fast', action='store_true', help="Без обновления полей через MS Word")
+    parser.add_argument('--legacy', action='store_true', help="Устаревший стиль оформления (Рис., Таблица 1.)")
+
     args = parser.parse_args()
-    
-    target = args.input
-    if not os.path.exists(target):
-        print(f"[!] Путь не найден: {target}")
-        sys.exit(1)
-        
-    if os.path.isdir(target):
-        import glob
-        files = glob.glob(os.path.join(target, "*.docx"))
-        working_files = [f for f in files if "GOST" not in f and not os.path.basename(f).startswith("~")]
-        for f in working_files:
-            format_document(f, args.fast, legacy=args.legacy)
+
+    if os.path.isdir(args.input):
+        import glob as g
+        files = g.glob(os.path.join(args.input, "*.docx"))
+        for f in files:
+            if "GOST" not in f and not os.path.basename(f).startswith("~"):
+                process_document(f, fast=args.fast, legacy=args.legacy)
     else:
-        format_document(target, args.fast, legacy=args.legacy)
+        process_document(args.input, args.output, fast=args.fast, legacy=args.legacy)

@@ -43,6 +43,7 @@ STRUCTURAL_KEYWORDS = {
     'РЕФЕРАТ', 'АННОТАЦИЯ', 'ЗАДАНИЕ',
     'ОПРЕДЕЛЕНИЯ', 'ОБОЗНАЧЕНИЯ И СОКРАЩЕНИЯ',
     'ПРИЛОЖЕНИЕ', 'ПРИЛОЖЕНИЯ',
+    'ПРЕЗЕНТАЦИОННЫЕ МАТЕРИАЛЫ',  # ★ ФИКС 33
 }
 
 # Ключевые слова, после которых начинается основная зона текста
@@ -279,42 +280,95 @@ def _insert_toc_before_intro(doc):
 #  Форматирование формул
 # ──────────────────────────────────────────────────────────────────
 
+def _get_right_tab_position(p):
+    """★ ФИКС 27: Вычислить позицию правой табуляции для номера формулы
+    по полям секции, в которой находится параграф.
+    page_width - left_margin - right_margin = ширина текста
+    Формула по центру, номер — по правому краю текста.
+    """
+    try:
+        # Получаем секцию параграфа через родительский элемент
+        p_elem = p._element
+        # Ищем sectPr — либо в pPr (секущий разрыв), либо последний sectPr
+        body = p_elem.getparent()
+        while body is not None and body.tag != qn('w:body'):
+            body = body.getparent()
+        if body is None:
+            return Cm(16.5)  # fallback
+        
+        # Собираем все sectPr в body
+        sect_elements = body.findall(qn('w:sectPr'))
+        # Также ищем sectPr внутри pPr параграфов (разрывы секций)
+        all_sect = list(sect_elements)
+        for p_el in body.findall(f'.//{qn("w:p")}/{qn("w:pPr")}/{qn("w:sectPr")}'):
+            all_sect.append(p_el)
+        
+        # Ищем в какой секции наш параграф
+        doc_part = p.part.document
+        sections = doc_part.sections
+        if not sections:
+            return Cm(16.5)
+        
+        # Простой подход: берём последнюю секцию (большинство формул в основной зоне)
+        # Для точного определения нужна сложная логика — пока берем предпоследнюю секцию
+        # (первая = титульник с другими полями)
+        sec = sections[-1] if len(sections) > 1 else sections[0]
+        if len(sections) > 1:
+            sec = sections[1]  # основная зона
+        
+        pw = sec.page_width or Mm(210)
+        lm = sec.left_margin or Cm(0)
+        rm = sec.right_margin or Cm(0)
+        right_tab = pw - lm - rm
+        return right_tab
+    except Exception:
+        return Cm(16.5)  # fallback для A4 30+15мм
+
+
 def _format_formula(p):
     """Выравнивание формулы (центр) и номера (справа) через табуляцию."""
-    # ★ ФИКС 9: Удалить все существующие TAB из runs — иначе формула съезжает
-    for run in p.runs:
-        if '\t' in run.text:
-            # Сохраняем только текст до первой табуляции (формулу),
-            # номер формулы (N.N) после последней табуляции
-            parts = run.text.split('\t')
-            # Фильтруем пустые части
-            non_empty = [x.strip() for x in parts if x.strip()]
-            if non_empty:
-                # Если больше 1 части — первая это формула, последняя может быть номером
-                if len(non_empty) >= 2 and _RE_FORMULA_NUM.search(non_empty[-1]):
-                    # Номер формулы в конце — нужно вынести в отдельный run
-                    run.text = non_empty[0] + '\t'  # формула + табуляция к центру
-                    # Номер формулы будет в tab stop справа
-                    # Добавляем табуляцию и номер как часть текста
-                    run.text = non_empty[0] + '\t\t' + non_empty[-1]
-                else:
-                    run.text = '\t'.join(non_empty)
-            else:
-                run.text = ''
-        # Также очистить XML-табуляции внутри run
-        for t_el in run._r.findall(qn('w:t')):
-            if t_el.text and '\t' in t_el.text:
-                t_el.text = t_el.text.replace('\t', ' ')
+    # ★ ФИКС 35: Полная переработка формул
+    # Формула должна быть по центру, номер (2.1) — по правому краю.
+    # Для этого нужен CENTER tab stop + RIGHT tab stop.
     
-    # ★ ФИКС 18: Формулы по ГОСТ — центрирование параграфа + правая табуляция для номера
-    # Раньше ставили LEFT + табуляции — ненадёжно, формула съезжала
+    has_omml = _has_math(p)
+    
+    if has_omml:
+        # Для OMML-формул: тело формулы в m:oMath, runs содержат только номер
+        # НЕ трогаем runs — только ставим выравнивание и tab stops
+        pass
+    else:
+        # Для текстовых формул: собираем текст, отделяем номер
+        full_text = ''
+        for run in p.runs:
+            full_text += run.text
+        
+        formula_text = full_text.strip()
+        formula_num = None
+        
+        m = _RE_FORMULA_NUM.search(formula_text)
+        if m:
+            formula_num = m.group(0)
+            formula_body = formula_text[:m.start()].strip().rstrip(',;:')
+        else:
+            formula_body = formula_text
+        
+        # Записываем в runs правильно
+        if len(p.runs) > 0:
+            p.runs[0].text = formula_body + '\t\t' + (formula_num or '')
+            for run in p.runs[1:]:
+                run.text = ''
+    
+    # Центрирование параграфа + табуляции
     _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.CENTER,
                            first_line_ind=Cm(0),
                            space_before=Pt(6), space_after=Pt(6))
     tab_stops = p.paragraph_format.tab_stops
     tab_stops.clear_all()
-    # Правый край (для A4 с полями 30+15мм) — номер формулы (1), (2.1) и т.д.
-    tab_stops.add_tab_stop(Cm(16.5), WD_TAB_ALIGNMENT.RIGHT)
+    right_tab = _get_right_tab_position(p)
+    center_tab = int(right_tab / 2)
+    tab_stops.add_tab_stop(center_tab, WD_TAB_ALIGNMENT.CENTER)
+    tab_stops.add_tab_stop(right_tab, WD_TAB_ALIGNMENT.RIGHT)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -322,8 +376,23 @@ def _format_formula(p):
 # ──────────────────────────────────────────────────────────────────
 
 def _normalize_tables(doc):
-    """Применяет ГОСТ к таблицам: шрифт, интервал, повтор шапки, границы."""
+    """Применяет ГОСТ к таблицам: шрифт, интервал, повтор шапки, границы, выравнивание."""
     for table in doc.tables:
+        # ★ ФИКС 29: Выравнивание таблиц по центру страницы
+        # Без jc таблицы съезжают вправо или влево
+        tbl = table._element
+        tblPr = tbl.find(qn('w:tblPr'))
+        if tblPr is None:
+            tblPr = OxmlElement('w:tblPr')
+            tbl.insert(0, tblPr)
+        # Удаляем существующий jc
+        for jc in tblPr.findall(qn('w:jc')):
+            tblPr.remove(jc)
+        # Ставим center
+        jc_el = OxmlElement('w:jc')
+        jc_el.set(qn('w:val'), 'center')
+        tblPr.append(jc_el)
+
         # Повтор шапки на каждой странице
         if len(table.rows) > 0:
             tr = table.rows[0]._tr
@@ -605,9 +674,10 @@ def _handle_structural_h1(p):
     # Раньше разрыв страницы ставился только для Heading 1, но не для STRUCTURAL_H1
     _insert_page_break_before(p)
     
+    # ★ ФИКС 30: Уменьшены отступы структурных заголовков (было sb=24/sa=12)
     _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.CENTER,
                            first_line_ind=Cm(0),
-                           space_before=Pt(24), space_after=Pt(12),
+                           space_before=Pt(12), space_after=Pt(6),
                            keep_next=True)
     # Убедимся что стиль — Heading 1
     try:
@@ -675,10 +745,12 @@ def _handle_heading(p):
         _insert_page_break_before(p)
 
     # Формат абзаца
+    # ★ ФИКС 30: Уменьшены space_before/after — раньше было sb=24/sa=12 для H1
+    # и sb=18/sa=12 для H2 — визуально огромные дыры между разделами
     _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.CENTER,
                            first_line_ind=Cm(0),
-                           space_before=Pt(24) if is_h1 else Pt(18),
-                           space_after=Pt(12),
+                           space_before=Pt(12) if is_h1 else Pt(8),
+                           space_after=Pt(6),
                            keep_next=True)
 
     # ★ ФИКС C: НЕ ставим font_size на runs если он None (наследуется от стиля Heading)
@@ -945,14 +1017,16 @@ def process_document(input_path, output_path=None, fast=False, legacy=False):
     wu.setup_gost_styles(doc)
 
     # 1. Параметры страницы
-    # ★ ФИКС 22: Устанавливаем размер страницы А4 (210×297 мм = 11906×16838 twips)
-    # Без этого секция могла быть Letter/Legal/произвольного размера из исходника
-    A4_WIDTH  = Mm(210)   # 11906 twips
-    A4_HEIGHT = Mm(297)   # 16838 twips
-    for section in doc.sections:
-        section.page_width   = A4_WIDTH
-        section.page_height  = A4_HEIGHT
-        section.orientation  = 0  # WD_ORIENT.PORTRAIT
+    # ★ ФИКС 26v2: НЕ трогаем ориентацию и размеры секций ВООБЩЕ!
+    # Альбомная секция (LANDSCAPE) должна оставаться — форматер убивал её.
+    # Размеры страниц оставляем как в оригинале — они правильные.
+    # ГОСТ-поля ставим ТОЛЬКО для секций основной зоны (не первая = титульник).
+    for i, section in enumerate(doc.sections):
+        if i == 0:
+            # Первая секция = титульник — НЕ трогаем вообще
+            continue
+        # Сохраняем ориентацию и размеры как есть
+        # Только устанавливаем ГОСТ-поля
         section.top_margin    = cfg.MARGIN_TOP
         section.bottom_margin = cfg.MARGIN_BOTTOM
         section.left_margin   = cfg.MARGIN_LEFT
@@ -1066,13 +1140,38 @@ def process_document(input_path, output_path=None, fast=False, legacy=False):
     if merged_headings:
         print(f"[ФИКС 16] Объединено {merged_headings} разделённых заголовков")
 
+    # ★ ФИКС 32: Удалить пустые Heading-абзацы
+    # В БР.docx есть пустые параграфы в стиле Heading (sb=24/sa=12),
+    # которые создают огромные визуальные дыры между разделами.
+    # Удаляем их.
+    removed_empty_headings = 0
+    all_paras = list(doc.paragraphs)
+    for p in all_paras:
+        style_name = p.style.name if p.style else ''
+        if not _is_heading_style(style_name):
+            continue
+        text = p.text.strip()
+        if not text and not _has_math(p) and not _has_image(p):
+            # Не удаляем если перед ним page break
+            if not p._element.xpath('.//w:br[@w:type="page"]'):
+                p._element.getparent().remove(p._element)
+                removed_empty_headings += 1
+    if removed_empty_headings:
+        print(f"[ФИКС 32] Удалено {removed_empty_headings} пустых Heading-абзацев")
+
     # Нужно пересчитывать is_main_zone по ходу, т.к. титульник может быть
     is_main_zone = False
     seen_main_trigger = False
     is_biblio_zone = False  # ★ Зона библиографии — не срезать numPr
+    is_post_conclusion = False  # ★ ФИКС 34: После ЗАКЛЮЧЕНИЯ — ничего не менять
     _lp_heading_counter[0] = 0  # ★ Сброс счётчика ФИКС 15
 
     for p in doc.paragraphs:
+        # ★ ФИКС 34: После ЗАКЛЮЧЕНИЯ ничего не меняем
+        upper = p.text.strip().upper().rstrip('.')
+        if is_post_conclusion:
+            continue  # пропускаем все параграфы после заключения
+
         # ★ ФИКС 13: Стили HTML Preformatted / Normal (Web) → нормальный Body
         style_name = p.style.name if p.style else 'Normal'
         if style_name in ('HTML Preformatted', 'Normal (Web)', 'No Spacing'):
@@ -1082,7 +1181,6 @@ def process_document(input_path, output_path=None, fast=False, legacy=False):
                 pass
 
         # Обновляем флаг основной зоны
-        upper = p.text.strip().upper().rstrip('.')
         if upper in MAIN_ZONE_TRIGGERS or _is_toc_style(p.style.name if p.style else ''):
             if not seen_main_trigger:
                 seen_main_trigger = True
@@ -1091,6 +1189,15 @@ def process_document(input_path, output_path=None, fast=False, legacy=False):
         # ★ Отслеживаем зону библиографии
         if upper in _BIBLIO_KEYWORDS:
             is_biblio_zone = True
+
+        # ★ ФИКС 34: После ЗАКЛЮЧЕНИЯ — ничего не менять
+        if upper == 'ЗАКЛЮЧЕНИЕ':
+            is_post_conclusion = True
+            # Ещё форматируем сам заголовок ЗАКЛЮЧЕНИЕ
+            ptype = _classify(p, is_main_zone, is_biblio_zone=is_biblio_zone, doc=doc)
+            if ptype == ParagraphType.STRUCTURAL_H1:
+                _handle_structural_h1(p)
+            continue
 
         ptype = _classify(p, is_main_zone, is_biblio_zone=is_biblio_zone, doc=doc)
 
@@ -1152,6 +1259,44 @@ def process_document(input_path, output_path=None, fast=False, legacy=False):
         output_path = os.path.join(out_dir, f"{base}_GOST.docx")
 
     wu.save_document_safe(doc, output_path)
+
+    # 7. ★ ФИКС 28: Восстановить титульник и секции из оригинала
+    # Форматер ломает титульник через setup_gost_styles (Heading стили наследуются)
+    # и может убить альбомную секцию.
+    # Решение: 1) заменить параграфы до ВВЕДЕНИЯ на оригинальные
+    #          2) восстановить свойства ВСЕХ секций из оригинала
+    print("[*] Восстанавливаем титульник из оригинала...")
+    title_backup = os.path.join(os.path.dirname(os.path.abspath(input_path)), 'БР_титульник.docx')
+    if os.path.exists(title_backup):
+        from extract_title import restore_title_section
+        restore_title_section(title_backup, output_path, output_path)
+    else:
+        print("[!] Файл титульника не найден — пропускаем восстановление")
+        print(f"    Ожидали: {title_backup}")
+
+    # ★ ФИКС 31: Восстановить свойства ВСЕХ секций из оригинала
+    # Форматер НЕ трогает первую секцию, но мог поломать ориентацию других.
+    # Восстанавливаем page_width/height/orientation для КАЖДОЙ секции.
+    print("[*] Восстанавливаем свойства секций из оригинала...")
+    try:
+        orig_doc = Document(input_path)
+        gost_doc = Document(output_path)
+        for i in range(min(len(orig_doc.sections), len(gost_doc.sections))):
+            o_sec = orig_doc.sections[i]
+            g_sec = gost_doc.sections[i]
+            g_sec.page_width = o_sec.page_width
+            g_sec.page_height = o_sec.page_height
+            g_sec.orientation = o_sec.orientation
+            # Для первой секции — полностью восстанавливаем поля из оригинала
+            if i == 0:
+                g_sec.left_margin = o_sec.left_margin
+                g_sec.right_margin = o_sec.right_margin
+                g_sec.top_margin = o_sec.top_margin
+                g_sec.bottom_margin = o_sec.bottom_margin
+        gost_doc.save(output_path)
+        print(f"[OK] Свойства секций восстановлены ({min(len(orig_doc.sections), len(gost_doc.sections))} секций)")
+    except Exception as e:
+        print(f"[!] Ошибка восстановления секций: {e}")
 
     # 8. COM-обновление (если не --fast)
     if not fast:

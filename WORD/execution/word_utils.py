@@ -75,8 +75,9 @@ def setup_gost_styles(doc):
             hs.font.color.rgb  = cfg.COLOR_BLACK
             hs.font.bold       = bold_map[lvl]
             hs.font.size       = size_map[lvl]
-            hs.paragraph_format.space_before      = Pt(24) if lvl == 1 else Pt(18)
-            hs.paragraph_format.space_after        = Pt(12)
+            # ★ ФИКС 30: Уменьшены space_before/after (было sb=24/sa=12 для H1)
+            hs.paragraph_format.space_before      = Pt(12) if lvl == 1 else Pt(8)
+            hs.paragraph_format.space_after        = Pt(6)
             hs.paragraph_format.line_spacing       = cfg.LINE_SPACING
             hs.paragraph_format.keep_with_next     = True
             hs.paragraph_format.alignment          = WD_ALIGN_PARAGRAPH.CENTER

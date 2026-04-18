@@ -174,8 +174,8 @@ def _insert_page_break_before(paragraph):
     # Не вставлять если уже есть разрыв перед заголовком
     if _has_page_break_before(paragraph):
         return
-    # Удалить пустые параграфы перед заголовком (они дают пустые страницы)
-    _remove_empty_paragraphs_before(paragraph)
+    # #v4_REMOVED: _remove_empty_paragraphs_before(paragraph)
+    # PRIMUM NON NOCERE: не удаляем параграфы — только ставим page_break_before
     
     # ★ ФИКС 21: page_break_before — не создаёт лишний параграф
     paragraph.paragraph_format.page_break_before = True
@@ -280,41 +280,65 @@ def _insert_toc_before_intro(doc):
 #  Форматирование формул
 # ──────────────────────────────────────────────────────────────────
 
+def _get_section_for_paragraph(p):
+    """★ v4.1: Определить секцию, в которой находится параграф.
+    Идём по body от начала, подсчитывая sectPr (разрывы секций).
+    Параграф принадлежит секции N, если он находится после (N-1)-го разрыва
+    и до N-го разрыва.
+    """
+    try:
+        p_elem = p._element
+        body = p_elem.getparent()
+        while body is not None and body.tag != qn('w:body'):
+            body = body.getparent()
+        if body is None:
+            return None
+
+        doc_part = p.part.document
+        sections = doc_part.sections
+        if not sections:
+            return None
+
+        # Простой подход: считаем sectPr в pPr ДО нашего параграфа
+        # Каждый sectPr в pPr означает конец секции
+        sect_count = 0
+        for child in body:
+            if child is p_elem:
+                break
+            # sectPr внутри pPr параграфа = конец секции
+            pPr = child.find(qn('w:pPr'))
+            if pPr is not None and pPr.find(qn('w:sectPr')) is not None:
+                sect_count += 1
+            # Таблицы — пропускаем (не параграфы)
+        
+        # sect_count = количество секций перед нашим параграфом
+        # Параграф в секции с индексом sect_count
+        if sect_count < len(sections):
+            return sections[sect_count]
+        return sections[-1]  # fallback
+    except Exception:
+        return None
+
+
 def _get_right_tab_position(p):
     """★ ФИКС 27: Вычислить позицию правой табуляции для номера формулы
     по полям секции, в которой находится параграф.
     page_width - left_margin - right_margin = ширина текста
     Формула по центру, номер — по правому краю текста.
+    ★ v4.1: Используем _get_section_for_paragraph для точного определения секции.
     """
     try:
-        # Получаем секцию параграфа через родительский элемент
-        p_elem = p._element
-        # Ищем sectPr — либо в pPr (секущий разрыв), либо последний sectPr
-        body = p_elem.getparent()
-        while body is not None and body.tag != qn('w:body'):
-            body = body.getparent()
-        if body is None:
-            return Cm(16.5)  # fallback
-        
-        # Собираем все sectPr в body
-        sect_elements = body.findall(qn('w:sectPr'))
-        # Также ищем sectPr внутри pPr параграфов (разрывы секций)
-        all_sect = list(sect_elements)
-        for p_el in body.findall(f'.//{qn("w:p")}/{qn("w:pPr")}/{qn("w:sectPr")}'):
-            all_sect.append(p_el)
-        
-        # Ищем в какой секции наш параграф
-        doc_part = p.part.document
-        sections = doc_part.sections
-        if not sections:
-            return Cm(16.5)
-        
-        # Простой подход: берём последнюю секцию (большинство формул в основной зоне)
-        # Для точного определения нужна сложная логика — пока берем предпоследнюю секцию
-        # (первая = титульник с другими полями)
-        sec = sections[-1] if len(sections) > 1 else sections[0]
-        if len(sections) > 1:
-            sec = sections[1]  # основная зона
+        sec = _get_section_for_paragraph(p)
+        if sec is None:
+            # Fallback: берём последнюю не-титульную секцию
+            doc_part = p.part.document
+            sections = doc_part.sections
+            if len(sections) > 1:
+                sec = sections[1]
+            elif sections:
+                sec = sections[0]
+            else:
+                return Cm(16.5)
         
         pw = sec.page_width or Mm(210)
         lm = sec.left_margin or Cm(0)
@@ -326,38 +350,11 @@ def _get_right_tab_position(p):
 
 
 def _format_formula(p):
-    """Выравнивание формулы (центр) и номера (справа) через табуляцию."""
-    # ★ ФИКС 35: Полная переработка формул
-    # Формула должна быть по центру, номер (2.1) — по правому краю.
-    # Для этого нужен CENTER tab stop + RIGHT tab stop.
-    
-    has_omml = _has_math(p)
-    
-    if has_omml:
-        # Для OMML-формул: тело формулы в m:oMath, runs содержат только номер
-        # НЕ трогаем runs — только ставим выравнивание и tab stops
-        pass
-    else:
-        # Для текстовых формул: собираем текст, отделяем номер
-        full_text = ''
-        for run in p.runs:
-            full_text += run.text
-        
-        formula_text = full_text.strip()
-        formula_num = None
-        
-        m = _RE_FORMULA_NUM.search(formula_text)
-        if m:
-            formula_num = m.group(0)
-            formula_body = formula_text[:m.start()].strip().rstrip(',;:')
-        else:
-            formula_body = formula_text
-        
-        # Записываем в runs правильно
-        if len(p.runs) > 0:
-            p.runs[0].text = formula_body + '\t\t' + (formula_num or '')
-            for run in p.runs[1:]:
-                run.text = ''
+    """Выравнивание формулы (центр) и номера (справа) через табуляцию.
+    ★ v4.2 PRIMUM NON NOCERE: НЕ трогаем runs вообще — только alignment + tab stops.
+    Старые <w:tab/> в runs остаются как есть. Они могут не идеально выравниваться
+    с новыми tab stops, но контент НЕ теряется.
+    ГОСТ: [формула по центру] TAB [(номер) по правому краю]."""
     
     # Центрирование параграфа + табуляции
     _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.CENTER,
@@ -369,6 +366,8 @@ def _format_formula(p):
     center_tab = int(right_tab / 2)
     tab_stops.add_tab_stop(center_tab, WD_TAB_ALIGNMENT.CENTER)
     tab_stops.add_tab_stop(right_tab, WD_TAB_ALIGNMENT.RIGHT)
+    
+    # ★ v4.2: Вся манипуляция runs ОТКЛЮЧЕНА — см. git history v4.1
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -529,13 +528,21 @@ def _is_manual_formula(text, style_name):
         words_before = re.findall(r'[а-яёА-ЯЁ]{4,}', before_eq)
         if words_before:
             # Исключение: сокращения типа "кВар", "кВт" — это единицы, не текст
-            unit_words = {'квар', 'квт', 'мвт', 'мвар'}
+            # ★ ФИКС V4: Добавлены индексы формул — "табл", "ном", "доп", "расч" и т.д.
+            # Это не русские слова, а условные обозначения в электротехнике
+            unit_words = {'квар', 'квт', 'мвт', 'мвар',
+                          'табл', 'ном', 'доп', 'макс', 'мин', 'расч',
+                          'общ', 'уст', 'раб', 'номи', 'откл'}
             non_unit = [w for w in words_before if w.lower() not in unit_words]
             if non_unit:
                 return False
         # Если после "=" есть числа или переменные — похоже на формулу
         after_eq = text.split('=', 1)[1] if '=' in text else ''
+        # ★ ФИКС V4: Расширено — не только цифры, но и переменные (tg, sin, cos, буквы)
         if after_eq.strip() and re.search(r'[\d∙×*/]', after_eq):
+            return True
+        # ★ ФИКС V4: "r = h · tg(α)" — после "=" нет цифр, но есть переменные/функции
+        if after_eq.strip() and re.search(r'[a-zA-Zα-ωα-ω]', after_eq):
             return True
     
     return False
@@ -684,28 +691,12 @@ def _handle_structural_h1(p):
         p.style = p.part.document.styles['Heading 1']
     except Exception:
         pass
-    # ★ БАГ 2/ФИКС 10b: Убрать точку в конце структурного заголовка (ГОСТ запрещает)
-    text = p.text.strip()
-    if text.endswith('.') and len(text) > 5:
-        for run in reversed(p.runs):
-            if run.text and run.text.rstrip().endswith('.') and not run.text.rstrip().endswith('..'):
-                run.text = run.text[:-1] if run.text.endswith('.') else run.text[:run.text.rfind('.')]
-                break
-    # Очистка табуляций из runs — они ломают центрирование
-    for run in p.runs:
-        if '\t' in run.text:
-            run.text = run.text.replace('\t', ' ').strip()
-        # Удаляем также XML-табуляции <w:tab/> и \t в w:t
-        for t_el in run._r.findall(qn('w:t')):
-            if t_el.text and '\t' in t_el.text:
-                t_el.text = t_el.text.replace('\t', ' ').strip()
-        for tab_el in run._r.findall(qn('w:tab')):
-            run._r.remove(tab_el)
-    # Очистка табуляций из XML параграфа (в т.ч. между runs)
-    pPr = p._element.find(qn('w:pPr'))
-    if pPr is not None:
-        for tabs in pPr.findall(qn('w:tabs')):
-            pPr.remove(tabs)
+    # #v4_REMOVED: Удаление точки в конце заголовка — PRIMUM NON NOCERE
+    # ГОСТ запрещает точку, но форматер не должен менять контент
+    # Точку убирает автор документа, не форматер
+    
+    # #v4_REMOVED: Очистка табуляций из runs — PRIMUM NON NOCERE
+    # Табуляции могут быть частью содержимого, не трогаем
     for run in p.runs:
         _set_run_font(run, font_size=cfg.FONT_SIZE_H1, bold=cfg.BOLD_H1)
 
@@ -715,30 +706,11 @@ def _handle_heading(p):
     level = _heading_level(p.style.name)
     is_h1 = (level == 1)
 
-    # ★ ФИКС 10: Убрать точку в конце заголовка (ГОСТ запрещает)
-    text = p.text.strip()
-    if text.endswith('.') and len(text) > 5:
-        # Не убираем точку если это номер раздела "1." (короткий текст)
-        # Или если точка — часть сокращения (кВт., кВ. — нет, заголовок не заканчивается так)
-        # Убираем точку из runs
-        for run in reversed(p.runs):
-            if run.text and run.text.rstrip().endswith('.'):
-                # Убираем точку только из последнего run
-                stripped = run.text.rstrip()
-                if stripped.endswith('.') and not stripped.endswith('..'):
-                    run.text = run.text[:-1] if run.text.endswith('.') else run.text[:run.text.rfind('.')]
-                    break
-
-    # Очистка табуляций из runs заголовка — они ломают центрирование
-    for run in p.runs:
-        if '\t' in run.text:
-            run.text = run.text.replace('\t', ' ').strip()
-        for t_el in run._r.findall(qn('w:t')):
-            if t_el.text and '\t' in t_el.text:
-                t_el.text = t_el.text.replace('\t', ' ').strip()
-        # ★ БАГ 5: Удаляем XML-табуляции <w:tab/>
-        for tab_el in run._r.findall(qn('w:tab')):
-            run._r.remove(tab_el)
+    # #v4_REMOVED: Удаление точки в конце заголовка — PRIMUM NON NOCERE
+    # ГОСТ запрещает точку, но форматер не должен менять контент
+    
+    # #v4_REMOVED: Очистка табуляций из runs — PRIMUM NON NOCERE
+    # Табуляции могут быть частью содержимого, не трогаем
 
     # Разрыв страницы перед H1 (кроме первого заголовка в документе)
     if is_h1:
@@ -797,100 +769,69 @@ def _handle_manual_formula(p):
 
 
 def _handle_figure_caption(p, legacy=False):
-    """Подпись к рисунку: по центру, без отступа."""
+    """Подпись к рисунку: по центру, без отступа.
+    ★ v4.0 PRIMUM NON NOCERE: НЕ перезаписываем runs — только стилизация.
+    Ренейминг "Рис." → "Рисунок" — минимальная правка."""
     _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.CENTER,
                            first_line_ind=Cm(0),
                            space_before=Pt(6), space_after=Pt(12))
 
+    # ★ v4.0: НЕ трогаем контент — только стилизация
+    # Ренейминг "Рис." → "Рисунок" — минимальная правка в runs
     text = p.text.strip()
     match = _RE_FIGURE.match(text)
-    if match:
-        num     = match.group(2)
-        caption = match.group(3).strip()
-        label   = "Рис. " if legacy else "Рисунок "
-        sep     = ". " if legacy else " — "
-
-        # Пересобираем текст, сохраняя runs для формул/спецсимволов
-        new_text = f"{label}{num}{sep}{caption}"
-        if legacy and not new_text.endswith('.'):
-            new_text += "."
-
-        # Не используем p.text = ... — это убьёт форматирование
-        # Вместо этого модифицируем первый run и удаляем лишние
-        if p.runs:
-            p.runs[0].text = new_text
-            for run in p.runs[1:]:
-                # Проверяем, не содержит ли run формулу или спецобъект
-                if _has_math_in_run(run):
-                    continue
-                run.text = ""
-        else:
-            p.add_run(new_text)
+    if match and not legacy:
+        label = match.group(1)
+        # Меняем "Рис." на "Рисунок" — минимальная правка в первом run
+        if label.lower().startswith('рис') and label.lower() != 'рисунок':
+            for run in p.runs:
+                if run.text and 'Рис.' in run.text:
+                    run.text = run.text.replace('Рис.', 'Рисунок ')
+                    break
+                elif run.text and 'рис.' in run.text:
+                    run.text = run.text.replace('рис.', 'Рисунок ')
+                    break
 
     for run in p.runs:
         _set_run_font(run, font_size=cfg.FONT_SIZE_MAIN, bold=False)
 
 
 def _handle_table_caption(p, doc=None, legacy=False):
-    """Подпись к таблице: слева без отступа, над таблицей."""
-    _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.LEFT,
-                           first_line_ind=Cm(0),
-                           space_before=Pt(12), space_after=Pt(6),
-                           keep_next=True)
-
+    """Подпись к таблице: над таблицей.
+    ★ ГОСТ: Если есть название (— Название) → левый край, без отступа.
+    ★ ГОСТ: Если НЕТ названия (только Таблица N) → правый край."""
     text = p.text.strip()
     match = _RE_TABLE_CAP.match(text)
-    if match:
-        num     = match.group(2)
-        caption = match.group(3).strip()
+    has_name = match and match.group(3) and match.group(3).strip()
+    
+    if has_name:
+        # "Таблица N — Название" → левый край, без отступа
+        _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.LEFT,
+                               first_line_ind=Cm(0),
+                               space_before=Pt(12), space_after=Pt(6),
+                               keep_next=True)
+    else:
+        # "Таблица N" → правый край
+        _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.RIGHT,
+                               first_line_ind=Cm(0),
+                               space_before=Pt(12), space_after=Pt(6),
+                               keep_next=True)
 
-        # ★ Если caption пустой — возможно название на следующей строке этого же параграфа
-        if not caption:
-            # Текст после "Таблица N.N —" или "Таблица N.N" до конца
-            remainder = text[match.end():].strip()
-            if remainder and len(remainder) < 200 and remainder.upper() not in STRUCTURAL_KEYWORDS:
-                caption = remainder
-
-        # ★ Если всё ещё пустой — ищем название в следующем параграфе
-        if not caption and doc is not None:
-            next_p = _find_next_paragraph(p, doc)
-            if next_p and next_p.text.strip():
-                next_text = next_p.text.strip()
-                # Не берём если это другой структурный элемент / заголовок
-                if not _is_heading_style(next_p.style.name if next_p.style else '') and \
-                   next_text.upper() not in STRUCTURAL_KEYWORDS and \
-                   len(next_text) < 200:
-                    caption = next_text
-                    # ★ БАГ 15: Удалить параграф с названием полностью (не просто очистить)
-                    next_p._element.getparent().remove(next_p._element)
-
-        # Названия таблиц должны быть в исходном документе (БР.docx)
-        # Если caption пустой — оставляем как есть
-
-        if legacy:
-            new_text = f"Таблица {num}."
-            if caption:
-                new_text = f"{caption}\nТаблица {num}."
-        else:
-            # ★ Отсеиваем мусорные названия (|, числа, короткий мусор)
-            if caption and len(caption) < 3:
-                caption = ""
-            # ★ Если caption содержит "Пример расчета" или "Примечани" — это не название таблицы
-            if caption and re.match(r'^(Пример|Приме[ч]|Примечание|П\s*р\s*и\s*м\s*е\s*ч)', caption, re.I):
-                caption = ""
-            if caption:
-                new_text = f"Таблица {num} — {caption}"
-            else:
-                new_text = f"Таблица {num}"
-
-        if p.runs:
-            p.runs[0].text = new_text
-            for run in p.runs[1:]:
-                if _has_math_in_run(run):
-                    continue
-                run.text = ""
-        else:
-            p.add_run(new_text)
+    # ★ v4.0: НЕ трогаем контент — только стилизация
+    # Ренейминг "Табл." → "Таблица" — минимальная правка runs (без перезаписи всего)
+    text = p.text.strip()
+    match = _RE_TABLE_CAP.match(text)
+    if match and not legacy:
+        label = match.group(1)
+        # Меняем "Табл." на "Таблица" — минимальная правка в первом run
+        if label.lower().startswith('табл'):
+            for run in p.runs:
+                if run.text and 'Табл.' in run.text:
+                    run.text = run.text.replace('Табл.', 'Таблица ')
+                    break
+                elif run.text and 'табл.' in run.text:
+                    run.text = run.text.replace('табл.', 'Таблица ')
+                    break
 
     for run in p.runs:
         _set_run_font(run, font_size=cfg.FONT_SIZE_MAIN, bold=False)
@@ -916,33 +857,27 @@ def _has_math_in_run(run):
 
 
 def _handle_list_item(p):
-    """Элемент списка: тире + текст, с абзацным отступом."""
+    """Элемент списка: тире + текст, с абзацным отступом.
+    ★ v4.0 PRIMUM NON NOCERE: НЕ перезаписываем runs полностью.
+    Только стилизация + минимальная правка маркера (замена • на —)."""
     # Удаляем системный маркер Word (numPr), если есть
     num_prs = p._element.xpath('.//w:numPr')
     if num_prs:
         pPr = p._element.get_or_add_pPr()
         pPr.remove(num_prs[0])
 
+    # ★ v4.0: НЕ перезаписываем runs — только минимальная правка маркера
+    # Заменяем • / – на — в первом run (если есть)
     text = p.text.strip()
-    # Заменяем маркер на ГОСТ-тире, но НЕ через p.text
-    clean = re.sub(r'^[-—–•\s]+', '', text)
-    # Убираем нумерованный префикс (а), 1)) и ставим тире
-    clean = _RE_NUM_LIST.sub('', clean) if _RE_NUM_LIST.match(clean) else clean
-
-    if p.runs:
-        # Переносим весь текст в первый run, остальные очищаем
-        # (кроме тех, что содержат формулы)
-        first = True
+    if text and text[0] in '-–•':
         for run in p.runs:
-            if _has_math_in_run(run):
-                continue
-            if first:
-                run.text = f"— {clean}"
-                first = False
-            else:
-                run.text = ""
-    else:
-        p.add_run(f"— {clean}")
+            if run.text:
+                # Заменяем первый маркер на ГОСТ-тире
+                for old_marker in ['•', '–', '-']:
+                    if run.text.lstrip().startswith(old_marker):
+                        run.text = run.text.replace(old_marker, '—', 1)
+                        break
+                break
 
     _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY,
                            first_line_ind=cfg.FIRST_LINE_INDENT,
@@ -953,27 +888,9 @@ def _handle_list_item(p):
 
 def _handle_where_line(p):
     """Строка «где ...» — расшифровка формулы. Без абзацного отступа.
-    ★ ФИКС 20: Удалить пустые параграфы перед 'где' — по ГОСТ расшифровка идёт сразу после формулы."""
-    # Удаляем пустые параграфы перед "где" (между формулой и расшифровкой)
-    prev_elem = p._element.getprevious()
-    while prev_elem is not None:
-        # Проверяем что это параграф и он пустой
-        tag = prev_elem.tag.split('}')[-1] if '}' in prev_elem.tag else prev_elem.tag
-        if tag != 'p':
-            break
-        # Есть ли текст или OMML в этом параграфе?
-        ns_w = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-        ns_m = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
-        texts = prev_elem.findall(f'.//{{{ns_w}}}t')
-        omath = prev_elem.findall(f'.//{{{ns_m}}}oMath')
-        has_text = any(t.text and t.text.strip() for t in texts)
-        if has_text or omath:
-            break  # Не пустой — остановились
-        # Пустой — удаляем
-        parent = prev_elem.getparent()
-        prev_prev = prev_elem.getprevious()
-        parent.remove(prev_elem)
-        prev_elem = prev_prev
+    ★ v4.0 PRIMUM NON NOCERE: НЕ удаляем пустые параграфы перед 'где' — только стилизация."""
+    # #v4_REMOVED: Удаление пустых параграфов перед "где"
+    # PRIMUM NON NOCERE: не удаляем параграфы
 
     _clear_indents_and_set(p, align=WD_ALIGN_PARAGRAPH.JUSTIFY,
                            first_line_ind=Cm(0),
@@ -993,10 +910,10 @@ def _handle_body(p):
 
 def _handle_empty(p):
     """Пустой параграф: минимальные интервалы, чтобы не было дыр.
-    ★ ФИКС B: НЕ ставим line_spacing на пустые абзацы — они раздули документ с 66 до 86 страниц."""
-    # ★ БАГ 21: Пустой параграф с page break создаёт пустую страницу — удалить break
-    for br in p._element.xpath('.//w:br[@w:type="page"]'):
-        br.getparent().remove(br)
+    ★ v4.0 PRIMUM NON NOCERE: НЕ удаляем page break из пустых абзацев —
+    автор мог поставить разрыв намеренно. Только стилизация интервалов."""
+    # #v4_REMOVED: Удаление page break из пустых параграфов
+    # PRIMUM NON NOCERE: page break мог быть поставлен автором намеренно
     pf = p.paragraph_format
     pf.space_before = Pt(0)
     pf.space_after  = Pt(0)
@@ -1064,113 +981,102 @@ def process_document(input_path, output_path=None, fast=False, legacy=False):
     # if removed_omml:
     #     print(f"[ФИКС 11] Удалено {removed_omml} пустых OMML-параграфов")
 
-    # ★ ФИКС I: Удалить подряд идущие пустые абзацы (оставлять максимум 1)
-    # В оригинале часто 3-5 пустых строк подряд — они раздували документ
-    removed_consecutive = 0
-    all_paras = list(doc.paragraphs)
-    consecutive_empty = 0
-    for p in all_paras:
-        is_empty = (not p.text.strip() and not _has_math(p) and not _has_image(p) and
-                    not p._element.xpath('.//w:br[@w:type="page"]'))
-        if is_empty:
-            consecutive_empty += 1
-            if consecutive_empty > 1:
-                p._element.getparent().remove(p._element)
-                removed_consecutive += 1
-        else:
-            consecutive_empty = 0
-    if removed_consecutive:
-        print(f"[ФИКС I] Удалено {removed_consecutive} лишних пустых абзацев (из серий >1)")
-
-    # ★ ФИКС 14: Удалить пустые страницы в хвосте документа (после ПРИЛОЖЕНИЯ)
-    # Ищем "ПРИЛОЖЕНИЯ" и удаляем всё после него, кроме параграфов с контентом
-    # ★ БАГ 6: Удаляем также параграфы с ТОЛЬКО page break — они создают пустые страницы
-    # ★ БАГ 10: Собираем параграфы к удалению, не удаляем на лету (IndexError)
-    found_appendix = False
-    last_content_idx = -1
-    all_paras = list(doc.paragraphs)
-    for i, p in enumerate(all_paras):
-        text = p.text.strip().upper()
-        if 'ПРИЛОЖЕН' in text:
-            found_appendix = True
-        if p.text.strip() or _has_math(p) or _has_image(p):
-            last_content_idx = i
+    # ★ v4.1 ФИКС I (мягкий): схлопывание серий пустых абзацев
+    # Старый ФИКС I ломал структуру (удалял пустые перед таблицами).
+    # Новый подход: схлопываем серии > 2 пустых, оставляем 2.
+    # Также удаляем пустые параграфы с page break (создают пустые страницы).
+    # ВАЖНО: сканируем только прямые children body (не внутри таблиц!)
+    # ВАЖНО: НЕ модифицируем body во время итерации — сначала собираем, потом удаляем!
+    MAX_CONSECUTIVE_EMPTY = 2
+    removed_empty = 0
+    body = doc.element.body
+    consecutive_empty_elems = []  # накапливаем пустые
+    to_remove = []  # элементы на удаление
     
-    # Удаляем пустые параграфы + параграфы с ТОЛЬКО page break после последнего контента
-    if found_appendix and last_content_idx >= 0:
-        removed_tail = 0
-        to_remove = []
-        for i in range(len(all_paras) - 1, last_content_idx, -1):
-            p = all_paras[i]
-            is_empty = not p.text.strip() and not _has_math(p) and not _has_image(p)
-            # Параграф только с page break — тоже мусор
-            has_only_break = (not p.text.strip() and
-                             len(p._element.xpath('.//w:br[@w:type="page"]')) > 0 and
-                             not _has_math(p) and not _has_image(p))
-            if is_empty or has_only_break:
-                to_remove.append(p._element)
-        for el in to_remove:
-            el.getparent().remove(el)
-            removed_tail += 1
-        if removed_tail:
-            print(f"[ФИКС 14] Удалено {removed_tail} пустых параграфов в хвосте")
-
-    # ★ ФИКС 16: Объединение разделённых заголовков (2 абзаца вместо 1)
-    # "4.5. Проверка выбранных сечений по допустимым" + "потерям напряжения"
-    merged_headings = 0
-    paras = list(doc.paragraphs)
-    for i in range(len(paras) - 1):
-        p_cur = paras[i]
-        p_next = paras[i + 1]
-        sn1 = p_cur.style.name if p_cur.style else ''
-        sn2 = p_next.style.name if p_next.style else ''
-        # Оба — заголовки одного уровня?
-        if _is_heading_style(sn1) and _is_heading_style(sn2) and _heading_level(sn1) == _heading_level(sn2):
-            text_cur = p_cur.text.strip()
-            text_next = p_next.text.strip()
-            # Текущий не заканчивается знаком препинания → продолжение
-            if text_cur and text_next and len(text_cur) > 5 and not text_cur[-1] in '.!?;:':
-                # Перенести текст next в последний run current
-                last_run = p_cur.runs[-1] if p_cur.runs else None
-                if last_run:
-                    last_run.text = last_run.text.rstrip() + ' ' + text_next
-                    # Удалить next paragraph
-                    p_next._element.getparent().remove(p_next._element)
-                    merged_headings += 1
-    if merged_headings:
-        print(f"[ФИКС 16] Объединено {merged_headings} разделённых заголовков")
-
-    # ★ ФИКС 32: Удалить пустые Heading-абзацы
-    # В БР.docx есть пустые параграфы в стиле Heading (sb=24/sa=12),
-    # которые создают огромные визуальные дыры между разделами.
-    # Удаляем их.
-    removed_empty_headings = 0
-    all_paras = list(doc.paragraphs)
-    for p in all_paras:
-        style_name = p.style.name if p.style else ''
-        if not _is_heading_style(style_name):
+    for child in list(body):  # list() — копия, безопасная для итерации
+        if child.tag != qn('w:p'):
+            # Это таблица или другой элемент — сбрасываем серию
+            if len(consecutive_empty_elems) > MAX_CONSECUTIVE_EMPTY:
+                to_remove.extend(consecutive_empty_elems[MAX_CONSECUTIVE_EMPTY:])
+            for wp_e, has_pb in consecutive_empty_elems[:MAX_CONSECUTIVE_EMPTY]:
+                if has_pb:
+                    to_remove.append((wp_e, True))
+            consecutive_empty_elems = []
             continue
-        text = p.text.strip()
-        if not text and not _has_math(p) and not _has_image(p):
-            # Не удаляем если перед ним page break
-            if not p._element.xpath('.//w:br[@w:type="page"]'):
-                p._element.getparent().remove(p._element)
-                removed_empty_headings += 1
-    if removed_empty_headings:
-        print(f"[ФИКС 32] Удалено {removed_empty_headings} пустых Heading-абзацев")
+        
+        wp = child
+        # Определяем, пустой ли параграф
+        texts = [t.text for t in wp.findall('.//' + qn('w:t')) if t.text]
+        full_text = ''.join(texts).strip()
+        has_object = wp.findall('.//' + qn('w:object'))
+        has_math = wp.findall('.//' + qn('m:oMath'))
+        has_image = wp.findall('.//' + qn('w:drawing'))
+        has_page_break = False
+        for br in wp.findall('.//' + qn('w:br')):
+            if br.get(qn('w:type')) == 'page':
+                has_page_break = True
+                break
+        pPr = wp.find(qn('w:pPr'))
+        has_sectPr = pPr is not None and pPr.find(qn('w:sectPr')) is not None
+        
+        is_empty = (not full_text and not has_object and not has_math 
+                    and not has_image and not has_sectPr)
+        
+        if is_empty:
+            consecutive_empty_elems.append((wp, has_page_break))
+        else:
+            # Конец серии пустых — схлопываем если > MAX
+            if len(consecutive_empty_elems) > MAX_CONSECUTIVE_EMPTY:
+                to_remove.extend(consecutive_empty_elems[MAX_CONSECUTIVE_EMPTY:])
+            for wp_e, has_pb in consecutive_empty_elems[:MAX_CONSECUTIVE_EMPTY]:
+                if has_pb:
+                    to_remove.append((wp_e, True))
+            consecutive_empty_elems = []
+    
+    # Обработка хвостовой серии
+    if len(consecutive_empty_elems) > MAX_CONSECUTIVE_EMPTY:
+        to_remove.extend(consecutive_empty_elems[MAX_CONSECUTIVE_EMPTY:])
+    for wp_e, has_pb in consecutive_empty_elems:
+        if has_pb:
+            to_remove.append((wp_e, True))
+    
+    # Удаление собранных элементов
+    for wp_e, _ in to_remove:
+        parent_e = wp_e.getparent()
+        if parent_e is not None:
+            parent_e.remove(wp_e)
+            removed_empty += 1
+    
+    if removed_empty:
+        print(f"[ФИКС I] Схлопнуто {removed_empty} лишних пустых абзацев")
+
+    # #v4_REMOVED: ФИКС 14 — заменён на ФИКС I выше (обрабатывает и хвост, и середину)
+
+    # #v4_REMOVED: ФИКС 16 — объединение разделённых заголовков
+    # PRIMUM NON NOCERE: не объединяем заголовки и не удаляем параграфы
+    # merged_headings = 0
+    # ... (код удалён — см. git history v3.8)
+
+    # #v4_REMOVED: ФИКС 32 — удаление пустых Heading-абзацев
+    # PRIMUM NON NOCERE: не удаляем пустые Heading-абзацы
+    # removed_empty_headings = 0
+    # ... (код удалён — см. git history v3.8)
 
     # Нужно пересчитывать is_main_zone по ходу, т.к. титульник может быть
     is_main_zone = False
     seen_main_trigger = False
     is_biblio_zone = False  # ★ Зона библиографии — не срезать numPr
-    is_post_conclusion = False  # ★ ФИКС 34: После ЗАКЛЮЧЕНИЯ — ничего не менять
+    # #v4_CHANGED: is_post_conclusion — НЕ пропускаем параграфы после ЗАКЛЮЧЕНИЯ
+    # PRIMUM NON NOCERE: форматер должен форматировать ВСЕ параграфы, включая после заключения
+    # Но для справки помечаем зону (если нужно для других целей)
+    is_post_conclusion = False
     _lp_heading_counter[0] = 0  # ★ Сброс счётчика ФИКС 15
 
     for p in doc.paragraphs:
-        # ★ ФИКС 34: После ЗАКЛЮЧЕНИЯ ничего не меняем
+        # ★ v4.0: После ЗАКЛЮЧЕНИЯ — форматируем шрифт, но не меняем контент
         upper = p.text.strip().upper().rstrip('.')
-        if is_post_conclusion:
-            continue  # пропускаем все параграфы после заключения
+        # #v4_REMOVED: continue после заключения — PRIMUM NON NOCERE
+        # Форматер должен обрабатывать ВСЕ параграфы, в т.ч. после заключения
 
         # ★ ФИКС 13: Стили HTML Preformatted / Normal (Web) → нормальный Body
         style_name = p.style.name if p.style else 'Normal'
@@ -1190,14 +1096,11 @@ def process_document(input_path, output_path=None, fast=False, legacy=False):
         if upper in _BIBLIO_KEYWORDS:
             is_biblio_zone = True
 
-        # ★ ФИКС 34: После ЗАКЛЮЧЕНИЯ — ничего не менять
+        # ★ v4.0: После ЗАКЛЮЧЕНИЯ — форматируем шрифт, но не меняем контент
         if upper == 'ЗАКЛЮЧЕНИЕ':
             is_post_conclusion = True
-            # Ещё форматируем сам заголовок ЗАКЛЮЧЕНИЕ
-            ptype = _classify(p, is_main_zone, is_biblio_zone=is_biblio_zone, doc=doc)
-            if ptype == ParagraphType.STRUCTURAL_H1:
-                _handle_structural_h1(p)
-            continue
+            # Форматируем сам заголовок ЗАКЛЮЧЕНИЕ и продолжаем
+            # (НЕ continue — параграфы после заключения тоже форматировать)
 
         ptype = _classify(p, is_main_zone, is_biblio_zone=is_biblio_zone, doc=doc)
 

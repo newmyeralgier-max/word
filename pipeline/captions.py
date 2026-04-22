@@ -177,6 +177,55 @@ def table_has_drawings(t_elem) -> bool:
     return bool(t_elem.findall(".//" + qn("w:drawing")))
 
 
+def is_figure_container_table(t_elem) -> bool:
+    """Определить, является ли таблица «контейнером для рисунка».
+
+    Критерии:
+    - 1-3 строки всего
+    - хотя бы в одной ячейке есть w:drawing
+    - и НЕТ признаков табличных данных: например, текстовые ячейки с
+      числовыми значениями в нескольких строках подряд.
+
+    Всё прочее (многорядные таблицы с числовыми данными, даже с случайно
+    попавшим в ячейку w:drawing) — это таблица данных (DATA).
+    """
+    rows = [c for c in t_elem if c.tag == qn("w:tr")]
+    if not rows:
+        return False
+    if not t_elem.findall(".//" + qn("w:drawing")):
+        return False
+
+    # Если строк много (>= 4) — почти наверняка таблица данных
+    if len(rows) >= 4:
+        return False
+
+    # Считаем «текстовые» ячейки (не-пустой текст БЕЗ drawing)
+    text_cells = 0
+    drawing_cells = 0
+    for row in rows:
+        for cell in row.findall(".//" + qn("w:tc")):
+            has_draw = bool(cell.findall(".//" + qn("w:drawing")))
+            txt = "".join(
+                (x.text or "") for x in cell.findall(".//" + qn("w:t"))
+            ).strip()
+            if has_draw:
+                drawing_cells += 1
+            elif txt:
+                text_cells += 1
+
+    # Маленькая таблица (≤3 строки) с одной ячейкой-рисунком и опциональной
+    # подписью — это контейнер рисунка.
+    if drawing_cells == 1 and text_cells <= 2:
+        return True
+
+    # 2 ячейки-рисунка и 0-1 текстовых — тоже контейнер (две стыкованные
+    # картинки с общей подписью).
+    if drawing_cells >= 2 and text_cells <= drawing_cells:
+        return True
+
+    return False
+
+
 def table_first_drawing_row_caption(t_elem) -> Optional[object]:
     """Вернуть параграф (XML) из строки ПОСЛЕ строки с картинкой — обычно в ней подпись.
 
@@ -398,7 +447,7 @@ def process_document(
         if cur_chapter == 0:
             cur_chapter = 1
 
-        if table_has_drawings(el):
+        if is_figure_container_table(el):
             # Это «фигурный контейнер» — ищем подпись внутри
             cap_p = table_first_drawing_row_caption(el)
             if cap_p is not None:
@@ -481,20 +530,10 @@ def process_document(
                 ch_num = cur_chapter
                 seq = tbl_counter.get(ch_num, 0) + 1
                 tbl_counter[ch_num] = seq
-                ctx_b, _ = _ctx(i, 3, 0)
-                # первый ряд для подсказки
-                first_row_text = ""
-                try:
-                    rows = [c for c in el if c.tag == qn("w:tr")]
-                    if rows:
-                        parts = []
-                        for cell in rows[0].findall(".//" + qn("w:tc")):
-                            for t in cell.findall(".//" + qn("w:t")):
-                                parts.append((t.text or "").strip())
-                        first_row_text = " ".join([p for p in parts if p])
-                except Exception:
-                    pass
-                title, conf = draft_title_from_context(ctx_b, first_row_text)
+                ctx_b, ctx_a = _ctx(i, 3, 3)
+                # ★ не используем первый ряд как заголовок: это ячейки шапки
+                # ("Параметр | Значение | ..."), а не название таблицы.
+                title, conf = draft_title_from_context(ctx_b, ctx_a)
                 new_text = f"Таблица {ch_num}.{seq} — {title}"
                 inserts_before.append((i, make_caption_paragraph(new_text, align="left")))
                 table_recs.append(
@@ -505,7 +544,7 @@ def process_document(
                         text=new_text,
                         confidence=conf,
                         source="generated",
-                        context=(ctx_b + " | first_row: " + first_row_text)[:200],
+                        context=(ctx_b + " | next: " + ctx_a)[:200],
                     )
                 )
 

@@ -84,7 +84,48 @@ TYPOGRAPHY_REPLACEMENTS: List[Tuple[str, str]] = [
     ("имени Владимира Даля ”", "имени Владимира Даля»"),
     ("имени Владимира Даля”", "имени Владимира Даля»"),
     ("“Луганский", "«Луганский"),
+    # ★ V4.1 доп. фиксы из скриншотов
+    ("Three-PhaseTransformer", "Three-Phase Transformer"),
+    ("Three-PhaseTranformer", "Three-Phase Transformer"),
+    ("ThreeWindings", "Three Windings"),
+    ("ТрёхобмоточныйТР", "Трёхобмоточный ТР"),
+    ("ТРЕХОБМОТОЧНЫЙТР", "ТРЕХОБМОТОЧНЫЙ ТР"),
+    ("WindingParameters", "Winding Parameters"),
+    ("фрагментокна", "фрагмент окна"),
+    ("окнакнастроек", "окна к настроек"),
+    ("настроекблока", "настроек блока"),
+    ("настроекоткорректированных", "настроек откорректированных"),
+    ("Окнопараметровблока", "Окно параметров блока "),
+    ("Окнонастроек", "Окно настроек "),
+    ("откорректированныхпараметров", "откорректированных параметров "),
+    ("параметровблока", "параметров блока "),
+    ("блокаThree-Phase", "блока Three-Phase "),
+    ("блокаThreePhase", "блока Three-Phase "),
+    ("блокаTransformer", "блока Transformer"),
+    ("блокаTransform", "блока Transform"),
+    ("кпримеру", "к примеру"),
+    ("попримеру", "по примеру"),
+    ("спримера", "с примера"),
+    ("Например", "Например"),
+    ("впримере", "в примере"),
+    ("типапримера", "типа примера"),
+    ("каквидно", "как видно"),
+    ("рассматриваемойсхемы", "рассматриваемой схемы"),
+    ("пренебрежимомалыми", "пренебрежимо малыми"),
 ]
+
+
+# ★ V4.1: общее правило «русская буква в конце + англ. слово сразу после»
+# Для того чтобы не перечислять все возможные случаи вручную.
+_RU_EN_STICK = re.compile(r"([а-яёА-ЯЁ])([A-Z][a-z]{2,})")
+_EN_RU_STICK = re.compile(r"([a-z]{2,})([А-ЯЁ][а-яё]+)")
+
+
+def _auto_split_glued(text: str) -> str:
+    # кириллица + англ. CamelCase слово → вставляем пробел
+    out = _RU_EN_STICK.sub(r"\1 \2", text)
+    out = _EN_RU_STICK.sub(r"\1 \2", out)
+    return out
 
 
 def apply_typography(doc_path_in: str, doc_path_out: str) -> dict:
@@ -92,6 +133,7 @@ def apply_typography(doc_path_in: str, doc_path_out: str) -> dict:
     doc = Document(doc_path_in)
     counts: Dict[str, int] = {}
     total = 0
+    auto_split = 0
     for p in doc.paragraphs:
         if paragraph_has_omml(p._element):
             continue
@@ -100,8 +142,22 @@ def apply_typography(doc_path_in: str, doc_path_out: str) -> dict:
             if n:
                 counts[old] = counts.get(old, 0) + n
                 total += n
+        # ★ V4.1 авто-разделитель слипшихся слов (rus+Eng / eng+Rus)
+        t_nodes = p._element.findall(".//" + qn("w:t"))
+        for tn in t_nodes:
+            if not tn.text:
+                continue
+            new_text = _auto_split_glued(tn.text)
+            if new_text != tn.text:
+                auto_split += 1
+                tn.text = new_text
+                tn.set(qn("xml:space"), "preserve")
     doc.save(doc_path_out)
-    return {"total_replacements": total, "per_pattern": counts}
+    return {
+        "total_replacements": total,
+        "per_pattern": counts,
+        "auto_split_runs": auto_split,
+    }
 
 
 # ─── Десятичные разделители ────────────────────────────────────────────────
@@ -185,36 +241,12 @@ def fix_decimals(doc_path_in: str, doc_path_out: str) -> dict:
 # Мапа «старый ключ заголовка (после удаления номера)» → «новый номер».
 # Ключ — нормализованный заголовок (lower, убраны знаки препинания в конце).
 
-SECTION_MAP: List[Tuple[str, str]] = [
-    # (substring match on heading text (case-insensitive), new_number)
-    # Главы 1-4 — уже корректно пронумерованы, но оставим для надёжности
-    ("ОСНОВЫ МОДЕЛИРОВАНИЯ В ПРОГРАММЕ MATLAB", "1"),
-    ("МОДЕЛИРОВАНИЕ ИСТОЧНИКОВ ЭЛЕКТРИЧЕСКОЙ ЭНЕРГИИ", "2"),
-    ("ОБЗОР ИЗМЕРИТЕЛЬНЫХ БЛОКОВ", "3"),
-    ("СХЕМЫ ЗАМЕЩЕНИЯ ЛИНИЙ ЭЛЕКТРОПЕРЕДАЧ", "4"),
-    ("СХЕМЫ ЗАМЕЩЕНИЯ ТРАНСФОРМАТОРОВ", "5"),
-    ("ОБЗОР КОММУТАЦИОННЫХ БЛОКОВ", "7"),
-    ("РАБОТА С БЛОКОМ POWERGUI", "8"),
-    ("РАБОТА С БЛОКОМ", "8"),
-    ("МОДЕЛИРОВАНИЕ КОЛЬЦЕВОЙ", "9"),
-]
-
-# Для H2/H3 в главе трансформаторов (5.x) и нагрузки (6.x) номера поехали —
-# нормализуем внутренние «2.2.x» → «5.x», «2.3.x» → «6.x».
-INNER_RENUMBER: List[Tuple[re.Pattern, str]] = [
-    # "2.2.2.1." -> "5.2.1" и т.п. — конкретно для зоны трансформаторов
-    (re.compile(r"^\s*2\.2\.2\.(\d+)\.?\s+(.+)$"), r"5.2.\1 \2"),
-    (re.compile(r"^\s*2\.2\.(\d+)\.?\s+(.+)$"), r"5.\1 \2"),
-    (re.compile(r"^\s*2\.3\.(\d+)\.?\s+(.+)$"), r"6.\1 \2"),
-    (re.compile(r"^\s*2\.3\s+(.+)$"), r"6 \1"),
-    # Коммутационные — "3.4.x" → "7.x"
-    (re.compile(r"^\s*3\.4\.(\d+)\.?\s+(.+)$"), r"7.\1 \2"),
-    (re.compile(r"^\s*3\.4\s+(.+)$"), r"7 \1"),
-    # Powergui — "4.2" ... "4.5" уже внутри главы 4 про линии, но пересекаются
-    # с новой главой 8. Если заголовок содержит «POWERGUI», Расчёт/Дискретизация —
-    # считаем, что это глава 8.
-    (re.compile(r"^\s*4\.(\d+)\.?\s+(Расчёт\s+схемы|Дискретизация|Расчёт\s+установ|Задание\s+начальных)", re.I), r"8.\1 \2"),
-]
+# ★ ФИКС V4.1: пустые. Агрессивная перенумерация в прошлый раз сломала
+# иерархию (пользователь пожаловался: «идёт 7 раздел, сразу стал 3.4»,
+# «9. Моделирование кольцевой — по идее только 5»). До тех пор пока нет
+# ручной карты, оставляем оригинальные номера из исходника нетронутыми.
+SECTION_MAP: List[Tuple[str, str]] = []
+INNER_RENUMBER: List[Tuple[re.Pattern, str]] = []
 
 
 def _renumber_chapter_title(text: str) -> str:
@@ -269,6 +301,65 @@ def renumber_sections(doc_path_in: str, doc_path_out: str) -> dict:
 # ─── Срезать точку в конце заголовков ──────────────────────────────────────
 
 _HEAD_RE = re.compile(r"^\s*\d+(\.\d+){0,3}\.?\s+\S")
+
+
+def replace_bullets_and_unbold(doc_path_in: str, doc_path_out: str) -> dict:
+    """★ V4.1:
+    1) «• » в начале параграфа → «— » (по ГОСТ).
+    2) Снимаем bold с абзацев, у которых ВСЕ runs — bold, текст длиннее 60
+       символов, стиль Normal/Body. Это «Этап 2. ...» и прочие случайно
+       полностью выделенные жирным абзацы.
+    """
+    doc = Document(doc_path_in)
+    bullets_replaced = 0
+    unbold_count = 0
+
+    from docx.oxml.ns import qn as _qn
+
+    for p in doc.paragraphs:
+        # 1) Bullet replacement
+        t_nodes = p._element.findall(".//" + _qn("w:t"))
+        for i, tn in enumerate(t_nodes):
+            if not tn.text:
+                continue
+            # обработать только первый непустой text-узел параграфа
+            stripped = tn.text.lstrip()
+            if stripped.startswith("•"):
+                # заменить «• » / «•» на «— »
+                new_text = tn.text.replace("•", "—", 1)
+                # убрать лишний пробел сразу после «—»
+                new_text = re.sub(r"—\s+", "— ", new_text, count=1)
+                if not new_text.lstrip().startswith("— "):
+                    new_text = new_text.replace("—", "— ", 1)
+                tn.text = new_text
+                tn.set(_qn("xml:space"), "preserve")
+                bullets_replaced += 1
+                break
+
+        # 2) Unbold длинных абзацев body text
+        full = p.text
+        if len(full.strip()) < 60:
+            continue
+        style = (p.style.name if p.style else "") or ""
+        if style.startswith("Heading") or style.startswith("Title") or style.startswith("toc"):
+            continue
+        # Пропускаем подписи рисунков/таблиц
+        if re.match(r"^\s*(Рисунок|Таблица)\b", full):
+            continue
+        runs = list(p.runs)
+        if not runs:
+            continue
+        # все runs c непустым текстом должны быть bold=True
+        text_runs = [r for r in runs if r.text and r.text.strip()]
+        if not text_runs:
+            continue
+        if all(r.bold for r in text_runs):
+            for r in text_runs:
+                r.bold = False
+            unbold_count += 1
+
+    doc.save(doc_path_out)
+    return {"bullets_replaced": bullets_replaced, "unbolded_paragraphs": unbold_count}
 
 
 def strip_trailing_periods_in_headings(doc_path_in: str, doc_path_out: str) -> dict:

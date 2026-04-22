@@ -79,8 +79,11 @@ def run(doc_path: str, out_path: str, *, verbose: bool = True):
     doc = Document(doc_path)
     stats = Counter()
 
-    # 0. Unify sections FIRST, чтобы все последующие расчёты шли от правильных
-    #    полей.
+    # 0a. Убить mirror margins в settings.xml — главный виновник «гуляющего»
+    #     текста: иначе чётные страницы получают зеркальные поля.
+    stats['mirror_killed'] = int(page.kill_mirror_margins(doc))
+
+    # 0b. Unify sections — одинаковые поля в каждом `sectPr`.
     page.unify_section_geometry(doc)
 
     # 1. Чистка — цвет, waves, удаление foreign block

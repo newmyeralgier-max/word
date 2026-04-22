@@ -20,6 +20,36 @@ def _set_orient(sec, orient_value: str):
         pgSz.set(qn('w:orient'), orient_value)
 
 
+def kill_mirror_margins(doc) -> bool:
+    """Убрать `<w:mirrorMargins/>` из settings.xml.
+
+    Главный виновник «гуляющего» текста: при mirror margins чётные страницы
+    получают зеркальные поля (L=15 / R=30 вместо L=30 / R=15). Word применяет
+    это автоматически, даже если `sectPr` одинаковы. Единственное место, где
+    включается эта галка — `settings.xml`.
+
+    Возвращает True, если что-то удалили.
+    """
+    try:
+        settings = doc.settings.element
+    except Exception:
+        return False
+    removed = False
+    for el in list(settings.iter(qn('w:mirrorMargins'))):
+        el.getparent().remove(el)
+        removed = True
+    # Заодно выключим evenAndOddHeaders — иначе тоже могут быть разные нижние
+    # колонтитулы на чётных / нечётных, что визуально воспринимается как съезд.
+    for el in list(settings.iter(qn('w:evenAndOddHeaders'))):
+        el.getparent().remove(el)
+        removed = True
+    # И gutterAtTop
+    for el in list(settings.iter(qn('w:gutterAtTop'))):
+        el.getparent().remove(el)
+        removed = True
+    return removed
+
+
 def unify_section_geometry(doc) -> int:
     """Выставить единые поля для всех секций.
 

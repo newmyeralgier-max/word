@@ -151,6 +151,52 @@ TYPOGRAPHY_REPLACEMENTS: List[Tuple[str, str]] = [
     ("Окнонастроек", "Окно настроек "),
     ("измеряемыепеременные", "измеряемые переменные"),
     ("параметровзагрузки", "параметров загрузки"),
+    # ★ V4.3: глубокие склейки из Session 5 ревью
+    # ex: "FrequencyusedforRLCspecification"
+    ("FrequencyusedforRLCspecification", "Frequency used for RLC specification"),
+    ("usedforRLCspecification", "used for RLC specification"),
+    ("usedfor", "used for "),
+    ("forRLCspecification", "for RLC specification"),
+    ("RLCspecification", "RLC specification"),
+    # слипшаяся кириллица без границ CamelCase — добиваем словарём
+    ("Окнанастроекконфигурации", "Окна настроек конфигурации "),
+    ("Окнанастроекпараметров", "Окна настроек параметров "),
+    ("Фрагментокнанастроек", "Фрагмент окна настроек "),
+    ("Фрагментокна", "Фрагмент окна "),
+    ("окнанастроекпараметров", "окна настроек параметров "),
+    ("окнанастроекконфигурации", "окна настроек конфигурации "),
+    ("окнанастроек", "окна настроек "),
+    ("настроекпараметровблока", "настроек параметров блока "),
+    ("настроекпараметров", "настроек параметров "),
+    ("настроекблокаThree", "настроек блока Three"),
+    ("параметровблокаThree", "параметров блока Three"),
+    ("конфигурацииSaturable", "конфигурации Saturable"),
+    ("конфигурацииLinear", "конфигурации Linear"),
+    ("параметровблокаSaturable", "параметров блока Saturable"),
+    ("параметровблокаLinear", "параметров блока Linear"),
+    ("блокаThree-Phase Transformer", "блока Three-Phase Transformer"),
+    # «а.ОкнанастроекконфигурацииSaturable Transformer» — варианты
+    ("а.Окнанастроек", "а. Окно настроек "),
+    ("б.Окнанастроек", "б. Окно настроек "),
+    ("в.Окнанастроек", "в. Окно настроек "),
+    # Session 6 добивка после pipeline-прогона
+    ("фрагментокнанастроек", "фрагмент окна настроек "),
+    ("ОкнапараметровблоковSeriesRLCLoad", "Окна параметров блоков Series RLC Load"),
+    ("иParallelRLCLoad", " и Parallel RLC Load"),
+    ("ParallelRLCLoad", "Parallel RLC Load"),
+    ("SeriesRLCLoad", "Series RLC Load"),
+    ("БлокThree-PhaseFault", "Блок Three-Phase Fault "),
+    ("Three-PhaseFault", "Three-Phase Fault"),
+    ("представляетсобой", " представляет собой "),
+    ("трёхфазныйкороткозамыкатель", "трёхфазный короткозамыкатель"),
+    ("короткозамыкатель", "короткозамыкатель"),
+    ("PhaseFaultпредставляетсобойтрёхфазный", "Phase Fault представляет собой трёхфазный"),
+    ("а.Окна настроек", "а. Окно настроек"),
+    ("б.Окна настроек", "б. Окно настроек"),
+    ("в.Окна настроек", "в. Окно настроек"),
+    # «ОкнанастроекконфигурацииSaturable Transformer»
+    ("Окна настроек конфигурации Saturable", "Окно настроек конфигурации Saturable"),
+    ("Окна настроек конфигурации Linear", "Окно настроек конфигурации Linear"),
 ]
 
 
@@ -168,23 +214,35 @@ def _auto_split_glued(text: str) -> str:
 
 
 def apply_typography(doc_path_in: str, doc_path_out: str) -> dict:
-    """Пройти по всем параграфам и применить словарные замены."""
+    """Пройти по ВСЕМ параграфам (включая вложенные в таблицы) и применить
+    словарные замены + авто-разделитель склеенных слов."""
     doc = Document(doc_path_in)
     counts: Dict[str, int] = {}
     total = 0
     auto_split = 0
-    for p in doc.paragraphs:
-        if paragraph_has_omml(p._element):
-            continue
+    body = doc.element.body
+    omml_tag = qn("m:oMath")
+    for p_elem in body.iter(qn("w:p")):
+        # Типография: безопасна внутри oMath — replace_in_paragraph
+        # обходит w:t внутри m:oMath.
         for old, new in TYPOGRAPHY_REPLACEMENTS:
-            n = replace_in_paragraph(p._element, old, new)
+            n = replace_in_paragraph(p_elem, old, new)
             if n:
                 counts[old] = counts.get(old, 0) + n
                 total += n
-        # ★ V4.1 авто-разделитель слипшихся слов (rus+Eng / eng+Rus)
-        t_nodes = p._element.findall(".//" + qn("w:t"))
-        for tn in t_nodes:
+        # ★ авто-разделитель слипшихся слов (rus+Eng / eng+Rus)
+        for tn in p_elem.findall(".//" + qn("w:t")):
             if not tn.text:
+                continue
+            # не трогать w:t внутри oMath
+            anc = tn.getparent()
+            inside_math = False
+            while anc is not None and anc is not p_elem:
+                if anc.tag == omml_tag:
+                    inside_math = True
+                    break
+                anc = anc.getparent()
+            if inside_math:
                 continue
             new_text = _auto_split_glued(tn.text)
             if new_text != tn.text:

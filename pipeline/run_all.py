@@ -42,6 +42,7 @@ from normalize import (
 from restructure import restructure
 from captions import process_document as apply_captions
 from renumber_refs import renumber as renumber_refs
+from align_formulas import align as align_formulas
 from stitch_title import stitch
 
 
@@ -73,6 +74,7 @@ def run(input_path: str, output_path: str, keep_intermediates: bool = True) -> d
     captions_json = str(work_dir / "captions.json")
     body_06b = str(work_dir / "body_06b_renumber_refs.docx")
     body_07 = str(work_dir / "body_07_gost.docx")
+    body_07b = str(work_dir / "body_07b_formulas.docx")
 
     report: dict = {}
 
@@ -125,8 +127,12 @@ def run(input_path: str, output_path: str, keep_intermediates: bool = True) -> d
     except OSError:
         pass
 
-    print(f"[8/8] stitch title  : {title_docx} + {body_07} → {output_path}")
-    stitch(body_07, title_docx, output_path)
+    print(f"[7b]   align formulas : {body_07}")
+    report["align_formulas"] = align_formulas(body_07, body_07b)
+    print("       ", report["align_formulas"])
+
+    print(f"[8/8] stitch title  : {title_docx} + {body_07b} → {output_path}")
+    stitch(body_07b, title_docx, output_path)
 
     print(f"[DONE] {output_path}")
     return report

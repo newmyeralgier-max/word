@@ -132,14 +132,38 @@ def find_first_structural_idx(elems: List[BodyElem]) -> int:
 
 # ─── Правка текста параграфа БЕЗОПАСНО через runs ──────────────────────────
 
+def _text_nodes_outside_math(p_elem):
+    """Вернуть все w:t этого параграфа, НЕ находящиеся внутри m:oMath.
+
+    Нужно, чтобы типография не портила содержимое формул (OMML-текст
+    тоже использует w:t-элементы через m:t, но с иным неймспейсом —
+    однако в некоторых случаях w:t встречается и внутри <m:oMath>
+    через <m:r>→<w:t>). Фильтруем по предкам.
+    """
+    omml_tag = qn("m:oMath")
+    out = []
+    for n in p_elem.findall(".//" + qn("w:t")):
+        # проверяем, нет ли среди предков m:oMath (до уровня параграфа)
+        anc = n.getparent()
+        inside_math = False
+        while anc is not None and anc is not p_elem:
+            if anc.tag == omml_tag:
+                inside_math = True
+                break
+            anc = anc.getparent()
+        if not inside_math:
+            out.append(n)
+    return out
+
+
 def replace_in_paragraph(p_elem, old: str, new: str) -> int:
     """Заменить подстроку в тексте параграфа, сохранив форматирование runs.
 
-    Стратегия: склеить все w:t в один строковый буфер, найти подстроку, потом
-    аккуратно распределить итог по существующим w:t (пропорционально позициям).
-    Возвращает число сделанных замен.
+    Стратегия: склеить все w:t (ВНЕ oMath) в один строковый буфер, найти
+    подстроку, положить итоговую строку в первый такой w:t, остальные чистим.
+    w:t внутри <m:oMath> НЕ трогаем — иначе собьёт формулы.
     """
-    t_nodes = p_elem.findall(".//" + qn("w:t"))
+    t_nodes = _text_nodes_outside_math(p_elem)
     if not t_nodes:
         return 0
     buf = "".join(n.text or "" for n in t_nodes)

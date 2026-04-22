@@ -5,7 +5,7 @@ from docx import Document
 
 from . import config as cfg
 from . import cleanup, detect, titles, headings, paragraphs, lists as lst, \
-              formulas, tables, figures, toc, page
+              formulas, tables, figures, toc, page, content
 from .utils import p_text, is_empty
 
 
@@ -91,11 +91,22 @@ def run(doc_path: str, out_path: str, *, verbose: bool = True):
     stats['proof_err_removed'] = cleanup.strip_underline_squiggle(doc)
     stats['foreign_block_removed'] = cleanup.remove_foreign_block(doc)
 
+    # 1a. Контент: починить даты в ЗАДАНИИ, снести рукописный TOC,
+    #     переписать ВВЕДЕНИЕ. РЕФЕРАТ и TOC вставляются позже,
+    #     чтобы порядок был: титул → РЕФЕРАТ → СОДЕРЖАНИЕ → ВВЕДЕНИЕ.
+    stats['dates_fixed'] = content.fix_task_dates(doc)
+    stats['manual_toc_removed'] = content.remove_manual_toc(doc)
+    stats['intro_rewritten'] = int(content.replace_intro(doc))
+
     # 2. Склейка подписей таблиц «Таблица X.Y» + «Название» → одна строка
     stats['captions_merged'] = cleanup.merge_table_captions(doc)
 
-    # 3. Коллапс серий пустых параграфов
-    stats['empty_collapsed'] = cleanup.collapse_empty_paragraphs(doc)
+    # 3. Коллапс серий пустых параграфов. ВАЖНО: слишком агрессивный коллапс
+    #    приводит к тому, что LibreOffice при конвертации в PDF теряет
+    #    финальные разделы (ЗАКЛЮЧЕНИЕ, СПИСОК ЛИТЕРАТУРЫ, ПРИЛОЖЕНИЯ) — часть
+    #    контента «прилипает» к плавающим OLE-объектам из ЗАДАНИЯ и уходит
+    #    за границу страницы. Поэтому оставляем до 3 подряд пустых.
+    stats['empty_collapsed'] = cleanup.collapse_empty_paragraphs(doc, max_consec=3)
 
     # 4. Определяем границу title zone
     title_end_idx = titles.find_title_zone_end(doc)
@@ -122,12 +133,17 @@ def run(doc_path: str, out_path: str, *, verbose: bool = True):
     # 8. Убрать точки в конце заголовков (на уровне runs)
     stats['dot_stripped'] = cleanup.strip_trailing_dot_in_headings(doc)
 
-    # 9. TOC вставить, если нет
+    # 9. TOC вставить, если нет. Сначала TOC (СОДЕРЖАНИЕ), потом РЕФЕРАТ
+    #    перед ним — итоговый порядок: титул → РЕФЕРАТ → СОДЕРЖАНИЕ → ВВЕДЕНИЕ.
     inserted = toc.insert_toc_before(doc)
     stats['toc_inserted'] = int(inserted)
+    stats['referat_inserted'] = int(content.insert_referat(doc))
 
     # 10. Повторяем unify — после вставок параграфов могут добавиться секции
     page.unify_section_geometry(doc)
+
+    # 10a. Чистка хвоста — удалить пустые абзацы после последнего содержательного.
+    stats['tail_blank_removed'] = content.remove_blank_tail(doc)
 
     # 11. Номера страниц
     page.add_page_numbers(doc, skip_first=True)

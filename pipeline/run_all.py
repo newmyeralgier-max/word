@@ -41,6 +41,7 @@ from normalize import (
 )
 from restructure import restructure
 from captions import process_document as apply_captions
+from renumber_refs import renumber as renumber_refs
 from stitch_title import stitch
 
 
@@ -70,6 +71,7 @@ def run(input_path: str, output_path: str, keep_intermediates: bool = True) -> d
     body_05 = str(work_dir / "body_05_strip_periods.docx")
     body_06 = str(work_dir / "body_06_captions.docx")
     captions_json = str(work_dir / "captions.json")
+    body_06b = str(work_dir / "body_06b_renumber_refs.docx")
     body_07 = str(work_dir / "body_07_gost.docx")
 
     report: dict = {}
@@ -103,12 +105,18 @@ def run(input_path: str, output_path: str, keep_intermediates: bool = True) -> d
     print("       ",
           {k: v for k, v in report["captions"].items() if not isinstance(v, list)})
 
-    print(f"[7/8] GOST format   : {body_06}")
+    print(f"[6b]   renumber refs : {body_06}")
+    report["renumber_refs"] = renumber_refs(body_06, body_06b)
+    print("       ",
+          {k: v for k, v in report["renumber_refs"].items()
+           if not isinstance(v, dict)})
+
+    print(f"[7/8] GOST format   : {body_06b}")
     # format_docx.process_document pattern: принимает input path и пишет рядом
     # с суффиксом _GOST.docx. Нам нужен точно body_07 на выходе.
     # Используем copy + process + rename.
     tmp_src = str(work_dir / "body_06_captions_for_gost.docx")
-    shutil.copy(body_06, tmp_src)
+    shutil.copy(body_06b, tmp_src)
     format_mod.process_document(tmp_src, fast=True)
     produced = tmp_src.replace(".docx", "_GOST.docx")
     shutil.move(produced, body_07)

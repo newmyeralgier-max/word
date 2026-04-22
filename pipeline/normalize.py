@@ -112,6 +112,45 @@ TYPOGRAPHY_REPLACEMENTS: List[Tuple[str, str]] = [
     ("каквидно", "как видно"),
     ("рассматриваемойсхемы", "рассматриваемой схемы"),
     ("пренебрежимомалыми", "пренебрежимо малыми"),
+    # ★ V4.2: слипшие английские имена после ревью
+    ("MATLABR2020b", "MATLAB R2020b"),
+    ("MATLABR2019b", "MATLAB R2019b"),
+    ("MATLABR", "MATLAB R"),
+    ("SpecializedPowerSystems", "Specialized Power Systems"),
+    ("SimPowerSystems", "SimPowerSystems"),  # keep — official name
+    ("MatrixLaboratory", "Matrix Laboratory"),
+    ("MathWorks", "MathWorks"),  # keep — company
+    ("CommandWindow", "Command Window"),
+    ("SimulinkStartPage", "Simulink Start Page"),
+    ("NewModel", "New Model"),
+    ("OpenModel", "Open Model"),
+    ("SaveModel", "Save Model"),
+    ("PrintModel", "Print Model"),
+    ("SimulationStopTime", "Simulation Stop Time"),
+    ("LibraryBrowser", "Library Browser"),
+    ("ModelExplorer", "Model Explorer"),
+    ("SaveAs", "Save As"),
+    ("ElectricalSources", "Electrical Sources"),
+    ("SeriesRLCBranch", "Series RLC Branch"),
+    ("Three-PhaseSeriesRLCBranch", "Three-Phase Series RLC Branch"),
+    ("Three-PhaseSeriesRLC", "Three-Phase Series RLC"),
+    ("ACCurrentSource", "AC Current Source"),
+    ("DCCurrentSource", "DC Current Source"),
+    # склейки: англ.+рус.
+    ("программеMATLAB", "программе MATLAB"),
+    ("моделейс", "моделей с"),
+    ("переменныеNone", "переменные None"),
+    # ОкноХХХ + block name в подписях
+    ("ВкладкиMain", "Вкладки Main"),
+    ("вменюParameters", "в меню Parameters"),
+    ("Окнанастроекконфигурации", "Окна настроек конфигурации "),
+    ("Окнонастроеквкладки", "Окно настроек вкладки "),
+    ("Окнонастроеквкладкиаа", "Окно настроек вкладки "),
+    ("ОкнонастроеквкладкиParameter", "Окно настроек вкладки Parameter "),
+    ("ОкнонастроеквкладкиConfiguration", "Окно настроек вкладки Configuration "),
+    ("Окнонастроек", "Окно настроек "),
+    ("измеряемыепеременные", "измеряемые переменные"),
+    ("параметровзагрузки", "параметров загрузки"),
 ]
 
 

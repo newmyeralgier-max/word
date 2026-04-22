@@ -39,6 +39,7 @@ from normalize import (
     replace_bullets_and_unbold,
     strip_trailing_periods_in_headings,
 )
+from restructure import restructure
 from captions import process_document as apply_captions
 from stitch_title import stitch
 
@@ -84,9 +85,10 @@ def run(input_path: str, output_path: str, keep_intermediates: bool = True) -> d
     report["decimals"] = fix_decimals(body_01, body_02)
     print("       ", report["decimals"])
 
-    print(f"[4/8] renumber      : {body_02}  (SECTION_MAP пуст → no-op)")
-    report["renumber"] = renumber_sections(body_02, body_03)
-    print("       ", {"changes": report["renumber"]["changes"]})
+    print(f"[4/8] restructure   : {body_02}")
+    report["restructure"] = restructure(body_02, body_03)
+    print("       ",
+          {k: v for k, v in report["restructure"].items() if k != "log_sample"})
 
     print(f"[4b]   bullets/unbold : {body_03}")
     report["bullets_unbold"] = replace_bullets_and_unbold(body_03, body_04)

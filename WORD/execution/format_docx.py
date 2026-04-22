@@ -456,8 +456,9 @@ def _is_section_heading(text):
     rest = m.group(2).strip()
     
     # ★ Отсеиваем ложные срабатывания:
-    # - Номер с 3+ уровнями (1.2.17) — это пункт списка, не заголовок
-    if num_part.count('.') >= 2:
+    # - Номер с 4+ уровнями (1.2.17.5) — это пункт списка, не заголовок.
+    # 3 уровня (1.5.1) допускаем как подраздел уровня 3 (Heading 3).
+    if num_part.count('.') >= 3:
         return False, 0
     # - Текст содержит матем. символы/formula: Iном, S=, P=, ≥, ≤
     if re.search(r'[=≥≤<>]', rest):
@@ -472,7 +473,9 @@ def _is_section_heading(text):
     # Если текст ЗАГЛАВНЫМИ — точно заголовок раздела
     upper_ratio = sum(1 for c in rest if c.isupper()) / max(len(rest), 1)
     if upper_ratio > 0.4:
-        return True, 1 if '.' not in num_part else 2
+        depth = num_part.count('.')
+        # 0 точек — H1, 1 — H2, 2 — H3
+        return True, max(1, min(depth + 1, 3))
     
     # ★ ФИКС 17: Если номер с точкой (1.1, 2.3) — это подраздел, порог ниже (>8 символов)
     # ГОСТ-заголовки подразделов бывают короткими: "5.1. Выбор схем" (11 символов)
@@ -491,8 +494,9 @@ def _is_section_heading(text):
         return False, 0
     min_len = 8
     if len(rest) > min_len and rest[0].isupper():
-        return True, 2
-    
+        depth = num_part.count('.')
+        return True, max(2, min(depth + 1, 3))
+
     return False, 0
 
 
@@ -596,6 +600,14 @@ def _classify(p, is_main_zone, is_biblio_zone=False, doc=None):
         # Структурные элементы — особый случай H1
         if level == 1 and upper in STRUCTURAL_KEYWORDS:
             return ParagraphType.STRUCTURAL_H1
+        # ★ Если номер-префикс не совпадает со стилем — пересчитать уровень
+        # (напр. исходник имел Heading 3 у «8.1 Исходные…», должно быть H2).
+        is_sh2, sh_level2 = _is_section_heading(text)
+        if is_sh2 and doc is not None and sh_level2 != level:
+            try:
+                p.style = doc.styles[f'Heading {sh_level2}']
+            except Exception:
+                pass
         return ParagraphType.HEADING
 
     # ★ Заголовок по ТЕКСТУ (стиль Normal, но выглядит как заголовок раздела)

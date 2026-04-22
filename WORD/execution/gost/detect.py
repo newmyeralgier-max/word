@@ -1,6 +1,8 @@
 """Классификаторы параграфов: заголовок, формула, подпись таблицы и т.п."""
 import re
 
+from docx.oxml.ns import qn
+
 from . import config as cfg
 from .utils import p_text, p_style_name, has_math, has_image, is_empty
 
@@ -107,11 +109,39 @@ def match_table_num_only(text):
 def is_formula_paragraph(p) -> bool:
     if has_math(p):
         return True
+    # OLE-equation (<w:object> с ProgID=Equation.*)
+    objs = p._element.findall('.//' + qn_w('object'))
+    if objs:
+        for obj in objs:
+            for ole in obj.iter():
+                if ole.tag.endswith('}OLEObject') and (ole.get('ProgID') or '').startswith('Equation'):
+                    return True
     # Текстовая формула-одиночка: заканчивается (N.M)
     t = p_text(p)
-    if t and _RE_FORMULA_NUM.search(t) and len(t) < 180:
+    if not t:
+        return False
+    if _RE_FORMULA_NUM.search(t) and len(t) < 220:
         return True
+    # Короткий (<160 chars) параграф, похожий на уравнение: есть '=' и мало
+    # кириллических «длинных» слов (> 3 букв). Примеры:
+    #   "Рвк = Fвк Руд.кв = 1,2·3,4=4,08"
+    #   "Руд = Руд.ул L=1,4·7,98 =11,18 кВт"
+    if len(t) <= 160 and '=' in t and not t.endswith(':'):
+        long_ru = re.findall(r'[а-яёА-ЯЁ]{4,}', t)
+        # Слово-исключение «где …» — это не формула
+        if re.match(r'^\s*(где|при|если|так)\b', t, re.I):
+            return False
+        # Заголовок/структурка уже ловится раньше в pipeline; здесь только
+        # страхуемся по числам.
+        if not re.search(r'\d', t):
+            return False
+        if len(long_ru) <= 1:
+            return True
     return False
+
+
+def qn_w(local: str) -> str:
+    return qn('w:' + local)
 
 
 def is_where_line(p) -> bool:

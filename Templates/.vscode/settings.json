@@ -1,8 +1,0 @@
-{
-    "python.defaultInterpreterPath": ".venv\\Scripts\\python.exe",
-    "python.analysis.extraPaths": ["C:\\bot"],
-    "python.envFile": "${workspaceFolder}\\.env",
-    "python.linting.enabled": true,
-    "python.linting.flake8Enabled": true,
-    "python.linting.pylintEnabled": true
-}

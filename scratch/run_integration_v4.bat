@@ -1,0 +1,2 @@
+@echo off
+"C:\Users\New-life\AppData\Local\Programs\Python\Python313\python.exe" "d:\1. Project\Word\scratch\integrate_content_v4.py"

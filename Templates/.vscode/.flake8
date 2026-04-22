@@ -1,4 +1,0 @@
-[flake8]
-max-line-length = 12099
-exclude = .venv,__pycache__,tpl,debug,back,tools/cfg
-extend-ignore = E203, W503, E302

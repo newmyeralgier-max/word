@@ -12,7 +12,11 @@ __pycache__/
 ~$*.docx
 ~$*.doc
 
-# Pipeline artifacts
+# Pipeline artifacts (current layout)
+WORD/data/backups/*
+!WORD/data/backups/.gitkeep
+
+# Pipeline artifacts (legacy layout, in case someone has older clone)
 data/_pipeline_work/
 data/backups/*
 !data/backups/.gitkeep

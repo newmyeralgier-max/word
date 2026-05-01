@@ -1,4 +1,4 @@
-"""
+r"""
 dedup_formula_numbers.py — убирает дублирующиеся номера формул вида «(N.M)(N.M)».
 
 Что делает (per-paragraph пасс через lxml):

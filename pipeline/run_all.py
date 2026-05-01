@@ -59,6 +59,23 @@ STEPS = [
 ]
 
 
+def _resolve_backup_dir() -> Path:
+    """Find the right backups directory.
+
+    The user's preferred layout is `WORD/data/backups/`. If that exists, use it.
+    Fallback: legacy `data/backups/` for older clones.
+    """
+    candidates = [
+        REPO_ROOT / 'WORD' / 'data' / 'backups',
+        REPO_ROOT / 'data' / 'backups',
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    # Default to user-preferred path even if missing — will be created.
+    return candidates[0]
+
+
 def parse_filter(s: str) -> set[str]:
     if not s:
         return set()
@@ -113,18 +130,22 @@ def main():
         sys.exit(2)
 
     # Backup
+    backup_dir = _resolve_backup_dir()
     if not args.no_backup:
-        backup_dir = REPO_ROOT / 'data' / 'backups'
         backup_dir.mkdir(parents=True, exist_ok=True)
         backup_path = backup_dir / f'{inp.stem}_pre_run.docx'
         shutil.copy2(inp, backup_path)
-        print(f'Backup → {backup_path.relative_to(REPO_ROOT)}')
+        try:
+            rel = backup_path.relative_to(REPO_ROOT)
+        except ValueError:
+            rel = backup_path
+        print(f'Backup → {rel}')
 
     # Tmp dir
-    tmp_dir = REPO_ROOT / 'data' / 'backups' / '.run_tmp'
+    tmp_dir = backup_dir / '.run_tmp'
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
     cur = inp
     applied = 0

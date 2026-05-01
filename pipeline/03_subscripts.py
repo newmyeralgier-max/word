@@ -107,6 +107,81 @@ def split_run_for_subscript(r_el):
     return new_runs
 
 
+def _rpr_signature(rpr_el):
+    """Stable serialization of <w:rPr> for adjacency comparison.
+
+    We compare structural shape (children + attrs), ignoring namespace prefix
+    differences so that two visually-identical rPr elements compare equal.
+    """
+    if rpr_el is None:
+        return ''
+
+    def serialize(el, parts):
+        parts.append(etree.QName(el).text)  # full {ns}local
+        # sort attrs for deterministic order
+        for k in sorted(el.attrib):
+            parts.append(f'@{k}={el.attrib[k]}')
+        if el.text:
+            parts.append(f't:{el.text}')
+        for child in el:
+            parts.append('(')
+            serialize(child, parts)
+            parts.append(')')
+
+    parts = []
+    serialize(rpr_el, parts)
+    return '|'.join(parts)
+
+
+def _is_plain_text_run(r):
+    for child in r:
+        tag = etree.QName(child).localname
+        if tag not in ('rPr', 't'):
+            return False
+    return r.find('w:t', NS) is not None
+
+
+def merge_adjacent_runs_in_container(container):
+    """Merge adjacent w:r children of `container` that have identical rPr.
+
+    This is a pre-pass for split_run_for_subscript: Word often writes 'k_ум'
+    as two runs ('k', '_ум') with the same rPr — split_run can't see across
+    runs and misses these. After merging, a single run holds 'k_ум' and the
+    regex matches. Only merges runs that contain plain w:t (no fldChar,
+    drawing, etc.).
+    """
+    runs = [c for c in container if etree.QName(c).localname == 'r']
+    i = 0
+    while i < len(runs) - 1:
+        r1 = runs[i]
+        r2 = runs[i + 1]
+        if not (_is_plain_text_run(r1) and _is_plain_text_run(r2)):
+            i += 1
+            continue
+        if r1.getnext() is not r2:
+            i += 1
+            continue
+        if _rpr_signature(r1.find('w:rPr', NS)) != _rpr_signature(r2.find('w:rPr', NS)):
+            i += 1
+            continue
+        t1 = r1.find('w:t', NS)
+        t2 = r2.find('w:t', NS)
+        merged = (t1.text or '') + (t2.text or '')
+        t1.text = merged
+        if merged != merged.strip():
+            t1.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        r2.getparent().remove(r2)
+        runs = [c for c in container if etree.QName(c).localname == 'r']
+        # don't advance i — try merging r1 with its new neighbor
+
+
+def merge_adjacent_runs(p):
+    """Merge same-rPr adjacent runs in p AND in any direct hyperlink children."""
+    merge_adjacent_runs_in_container(p)
+    for hl in p.findall('w:hyperlink', NS):
+        merge_adjacent_runs_in_container(hl)
+
+
 def process(input_path: Path, output_path: Path):
     with zipfile.ZipFile(input_path, 'r') as zin:
         data = {n: zin.read(n) for n in zin.namelist()}
@@ -119,7 +194,12 @@ def process(input_path: Path, output_path: Path):
         # skip paragraphs inside <m:oMath> — formulas already typeset
         if p.xpath('ancestor::m:oMath', namespaces={'m':'http://schemas.openxmlformats.org/officeDocument/2006/math'}):
             continue
+        # Pre-pass: merge adjacent same-rPr text runs so split patterns are visible.
+        merge_adjacent_runs(p)
+        # Process direct-child runs AND runs inside hyperlinks (e.g. TOC entries).
         runs = list(p.findall('w:r', NS))
+        for hl in p.findall('w:hyperlink', NS):
+            runs.extend(hl.findall('w:r', NS))
         for r in runs:
             new_runs = split_run_for_subscript(r)
             if new_runs:

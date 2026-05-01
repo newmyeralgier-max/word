@@ -1,145 +1,157 @@
-"""Полный прогон ГОСТ-пайплайна v4.1.
+"""
+run_all.py — единый оркестратор всех 12 шагов пайплайна.
 
-Шаги:
-1. Извлекаем титульник (01_extract_title.py) → title.docx + body_00.docx
-2. Типография + авто-сплит слипшихся слов (normalize.apply_typography)
-3. Десятичные разделители (normalize.fix_decimals)
-4. Замена «•» → «—» + снятие bold с body (normalize.replace_bullets_and_unbold)
-5. Срез точек в конце заголовков (normalize.strip_trailing_periods_in_headings)
-6. Подписи рисунков/таблиц (captions.process_document)
-7. ГОСТ-форматирование тела (WORD/execution/format_docx.process_document)
-8. Склейка: title.docx + body → final.docx (stitch_title.stitch)
-9. Валидация (WORD/execution/validate_formatter.py) — опционально
+Применяет шаги по порядку 01..12 к входному .docx, сохраняет результат
+в выходной .docx. Промежуточные файлы — в временной папке.
 
-Перенумерация глав в этой версии ВЫКЛЮЧЕНА (SECTION_MAP пуст) — в прошлый
-раз она сломала иерархию разделов (жалобы пользователя #11, #13, #14).
-Оригинальные номера из исходника НЕ трогаются.
+Каждый шаг — это отдельный скрипт с интерфейсом
+    python pipeline/NN_<name>.py --input X.docx --output Y.docx
+
+Зачем такая архитектура (вместо одного большого скрипта):
+- Каждая проблема изолирована в своём файле.
+- Любой шаг можно прогнать отдельно или пропустить (--skip / --only).
+- Идемпотентность гарантируется на уровне отдельных скриптов.
 
 Использование:
-    cd pipeline && python run_all.py <input.docx> <output.docx>
-"""
-from __future__ import annotations
+    # Полный прогон
+    python pipeline/run_all.py \\
+        --input  data/файл.docx \\
+        --output data/файл_GOST.docx
 
-import importlib.util
-import os
+    # Прогнать только шаги 09,10 (восстановление номеров страниц)
+    python pipeline/run_all.py \\
+        --input  data/файл.docx \\
+        --output data/файл_fixed.docx \\
+        --only 09,10
+
+    # Прогнать всё, кроме шага 08 (объединение разделов)
+    python pipeline/run_all.py \\
+        --input  data/файл.docx \\
+        --output data/файл_GOST.docx \\
+        --skip 08
+
+Бэкап оригинала автоматически создаётся в `data/backups/<имя>_pre_run.docx`.
+"""
+
+import argparse
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).parent.resolve()
-REPO = HERE.parent
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(REPO / "WORD" / "execution"))
+PIPELINE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = PIPELINE_DIR.parent
 
-from normalize import (
-    apply_typography,
-    fix_decimals,
-    renumber_sections,
-    replace_bullets_and_unbold,
-    strip_trailing_periods_in_headings,
-)
-from restructure import restructure
-from captions import process_document as apply_captions
-from renumber_refs import renumber as renumber_refs
-from align_formulas import align as align_formulas
-from stitch_title import stitch
-
-
-def _load(path: Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, str(path))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+# Список шагов в порядке применения. Префикс файла = ID шага.
+STEPS = [
+    ('01', 'pagesetup',           '01_pagesetup.py',           'A4, поля, titlePg, footerReference'),
+    ('02', 'pagebreaks',          '02_pagebreaks.py',          'pageBreakBefore на H1 (главы с новой страницы)'),
+    ('03', 'subscripts',          '03_subscripts.py',          'P_a → Pₐ (vertAlign=subscript)'),
+    ('04', 'wrap_figures',        '04_wrap_figures.py',        'Рисунки в 2-ячеечные таблицы (рисунок + подпись)'),
+    ('05', 'normalize_tables',    '05_normalize_tables.py',    'Таблицы данных: TNR 12pt, без жирных заголовков'),
+    ('06', 'dedup_formulas',      '06_dedup_formulas.py',      'Удалить дубли (N.M)(N.M) в подписях формул'),
+    ('07', 'renumber_formulas',   '07_renumber_formulas.py',   'Перенумерация формул сквозная по главе: (N.M)'),
+    ('08', 'merge_sections',      '08_merge_sections.py',      'Объединить раздел 9 в 10 (в данном проекте)'),
+    ('09', 'footer_pagenumber',   '09_footer_pagenumber.py',   'Канонический PAGE-field в footer1.xml'),
+    ('10', 'remove_hidewhitespace', '10_remove_hidewhitespace.py', 'Снять <w:doNotDisplayPageBoundaries/>'),
+    ('11', 'turbo_postpass',      '11_turbo_postpass.py',      'Постпроход: пустые pbb-параграфы, TOC stale, ПРОПАЛА, updateFields'),
+    ('12', 'clear_highlights',    '12_clear_highlights.py',    'Снять все жёлтые подсветки (последним)'),
+]
 
 
-extract_mod = _load(HERE / "01_extract_title.py", "_extract_title")
-format_mod = _load(REPO / "WORD" / "execution" / "format_docx.py", "_format_docx")
+def parse_filter(s: str) -> set[str]:
+    if not s:
+        return set()
+    out = set()
+    for part in s.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        # allow "07" or "renumber_formulas"
+        if part.isdigit():
+            out.add(part.zfill(2))
+        else:
+            for sid, name, _, _ in STEPS:
+                if name == part:
+                    out.add(sid)
+                    break
+    return out
 
 
-def run(input_path: str, output_path: str, keep_intermediates: bool = True) -> dict:
-    input_path = str(Path(input_path).resolve())
-    output_path = str(Path(output_path).resolve())
-    work_dir = Path(output_path).parent / "_pipeline_work"
-    work_dir.mkdir(parents=True, exist_ok=True)
+def main():
+    ap = argparse.ArgumentParser(
+        description='Apply all pipeline steps in order 01..12 to a .docx file.',
+    )
+    ap.add_argument('--input', required=True, help='Input .docx path')
+    ap.add_argument('--output', required=True, help='Output .docx path')
+    ap.add_argument('--only', default='',
+                    help='Comma-separated list of step IDs/names to run '
+                         '(e.g. "07,08" or "renumber_formulas")')
+    ap.add_argument('--skip', default='',
+                    help='Comma-separated list of step IDs/names to skip')
+    ap.add_argument('--no-backup', action='store_true',
+                    help='Do not create a backup in data/backups/')
+    ap.add_argument('--list', action='store_true', help='List steps and exit')
+    args = ap.parse_args()
 
-    title_docx = str(work_dir / "title.docx")
-    body_00 = str(work_dir / "body_00_raw.docx")
-    body_01 = str(work_dir / "body_01_typo.docx")
-    body_02 = str(work_dir / "body_02_decimals.docx")
-    body_03 = str(work_dir / "body_03_renumber.docx")
-    body_04 = str(work_dir / "body_04_bullets_unbold.docx")
-    body_05 = str(work_dir / "body_05_strip_periods.docx")
-    body_06 = str(work_dir / "body_06_captions.docx")
-    captions_json = str(work_dir / "captions.json")
-    body_06b = str(work_dir / "body_06b_renumber_refs.docx")
-    body_07 = str(work_dir / "body_07_gost.docx")
-    body_07b = str(work_dir / "body_07b_formulas.docx")
+    if args.list:
+        print('Pipeline steps:')
+        for sid, name, fname, desc in STEPS:
+            print(f'  {sid}  {name:24s}  {desc}')
+        return
 
-    report: dict = {}
+    only = parse_filter(args.only)
+    skip = parse_filter(args.skip)
 
-    print(f"[1/8] extract title : {input_path}")
-    extract_mod.extract(input_path, title_docx, body_00)
+    inp = Path(args.input).resolve()
+    out = Path(args.output).resolve()
+    if not inp.exists():
+        print(f'ERROR: input not found: {inp}', file=sys.stderr)
+        sys.exit(2)
 
-    print(f"[2/8] typography    : {body_00}")
-    report["typography"] = apply_typography(body_00, body_01)
-    print("       ", report["typography"])
+    # Backup
+    if not args.no_backup:
+        backup_dir = REPO_ROOT / 'data' / 'backups'
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f'{inp.stem}_pre_run.docx'
+        shutil.copy2(inp, backup_path)
+        print(f'Backup → {backup_path.relative_to(REPO_ROOT)}')
 
-    print(f"[3/8] decimals      : {body_01}")
-    report["decimals"] = fix_decimals(body_01, body_02)
-    print("       ", report["decimals"])
+    # Tmp dir
+    tmp_dir = REPO_ROOT / 'data' / 'backups' / '.run_tmp'
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
 
-    print(f"[4/8] restructure   : {body_02}")
-    report["restructure"] = restructure(body_02, body_03)
-    print("       ",
-          {k: v for k, v in report["restructure"].items() if k != "log_sample"})
+    cur = inp
+    applied = 0
+    for sid, name, fname, desc in STEPS:
+        if only and sid not in only:
+            continue
+        if sid in skip:
+            print(f'[skip {sid}] {name}: {desc}')
+            continue
+        next_path = tmp_dir / f'{sid}_after_{name}.docx'
+        script = PIPELINE_DIR / fname
+        print(f'\n=== Step {sid}: {name} ({desc}) ===')
+        proc = subprocess.run(
+            [sys.executable, str(script),
+             '--input', str(cur),
+             '--output', str(next_path)],
+            capture_output=False,
+        )
+        if proc.returncode != 0:
+            print(f'\nERROR: step {sid} ({name}) failed with code {proc.returncode}',
+                  file=sys.stderr)
+            sys.exit(proc.returncode)
+        cur = next_path
+        applied += 1
 
-    print(f"[4b]   bullets/unbold : {body_03}")
-    report["bullets_unbold"] = replace_bullets_and_unbold(body_03, body_04)
-    print("       ", report["bullets_unbold"])
-
-    print(f"[5/8] strip periods : {body_04}")
-    report["strip_periods"] = strip_trailing_periods_in_headings(body_04, body_05)
-    print("       ", report["strip_periods"])
-
-    print(f"[6/8] captions      : {body_05}")
-    report["captions"] = apply_captions(body_05, body_06, captions_json)
-    print("       ",
-          {k: v for k, v in report["captions"].items() if not isinstance(v, list)})
-
-    print(f"[6b]   renumber refs : {body_06}")
-    report["renumber_refs"] = renumber_refs(body_06, body_06b)
-    print("       ",
-          {k: v for k, v in report["renumber_refs"].items()
-           if not isinstance(v, dict)})
-
-    print(f"[7/8] GOST format   : {body_06b}")
-    # format_docx.process_document pattern: принимает input path и пишет рядом
-    # с суффиксом _GOST.docx. Нам нужен точно body_07 на выходе.
-    # Используем copy + process + rename.
-    tmp_src = str(work_dir / "body_06_captions_for_gost.docx")
-    shutil.copy(body_06b, tmp_src)
-    format_mod.process_document(tmp_src, fast=True)
-    produced = tmp_src.replace(".docx", "_GOST.docx")
-    shutil.move(produced, body_07)
-    try:
-        os.remove(tmp_src)
-    except OSError:
-        pass
-
-    print(f"[7b]   align formulas : {body_07}")
-    report["align_formulas"] = align_formulas(body_07, body_07b)
-    print("       ", report["align_formulas"])
-
-    print(f"[8/8] stitch title  : {title_docx} + {body_07b} → {output_path}")
-    stitch(body_07b, title_docx, output_path)
-
-    print(f"[DONE] {output_path}")
-    return report
+    # Copy final to output
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(cur, out)
+    print(f'\nDone. Applied {applied} step(s). Output → {out}')
 
 
-if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python run_all.py <input.docx> <output.docx>")
-        sys.exit(1)
-    run(sys.argv[1], sys.argv[2])
+if __name__ == '__main__':
+    main()

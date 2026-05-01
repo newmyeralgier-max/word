@@ -82,8 +82,8 @@ def main():
     ap = argparse.ArgumentParser(
         description='Apply all pipeline steps in order 01..12 to a .docx file.',
     )
-    ap.add_argument('--input', required=True, help='Input .docx path')
-    ap.add_argument('--output', required=True, help='Output .docx path')
+    ap.add_argument('--input', help='Input .docx path')
+    ap.add_argument('--output', help='Output .docx path')
     ap.add_argument('--only', default='',
                     help='Comma-separated list of step IDs/names to run '
                          '(e.g. "07,08" or "renumber_formulas")')
@@ -99,6 +99,9 @@ def main():
         for sid, name, fname, desc in STEPS:
             print(f'  {sid}  {name:24s}  {desc}')
         return
+
+    if not args.input or not args.output:
+        ap.error('--input and --output are required (unless --list is given)')
 
     only = parse_filter(args.only)
     skip = parse_filter(args.skip)
